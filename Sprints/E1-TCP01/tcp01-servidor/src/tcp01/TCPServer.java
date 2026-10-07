@@ -7,11 +7,10 @@ public class TCPServer {
     public static void main(String[] args) {
         try {
             int serverPort = 7896;
-            ServerSocket listenSocket = new ServerSocket(serverPort);   // fica à escuta no porto 7896
-            System.out.println("Servidor à escuta no porto " + serverPort);
+            ServerSocket listenSocket = new ServerSocket(serverPort);
             while (true) {
-                Socket clientSocket = listenSocket.accept();            // BLOQUEIA até um cliente se ligar
-                Connection c = new Connection(clientSocket);            // trata o cliente noutra thread
+                Socket clientSocket = listenSocket.accept();    // bloqueia à espera de uma ligação
+                Connection c = new Connection(clientSocket);    // processa o pedido noutra thread
             }
         } catch (IOException e) {
             System.out.println("Listen: " + e.getMessage());
