@@ -22,18 +22,23 @@ public class Connection extends Thread {
     @Override
     public void run() {
         try {
-            String data = in.readUTF();                         // lê os dados do cliente
-            out.writeUTF(data);                                 // envia a resposta ao cliente
+            ObjectInputStream ois = new ObjectInputStream(clientSocket.getInputStream());
+            Person p = (Person) ois.readObject();      // cast obrigatório (CA3)
+
+            // 4.2:
+            //out.writeUTF(p.getName());
+            // 4.3: responder com a localidade
+            out.writeUTF(p.getPlace().getLocality());
+
         } catch (EOFException e) {
             System.out.println("EOF: " + e.getMessage());
+        } catch (ClassNotFoundException e) {
+            System.out.println("ClassNotFound: " + e.getMessage());
         } catch (IOException e) {
             System.out.println("IO: " + e.getMessage());
         } finally {
-            try {
-                clientSocket.close();
-            } catch (IOException e) {
-                /* falha ao fechar */
-            }
+            try { clientSocket.close(); }
+            catch (IOException e) { /* falha ao fechar */ }
         }
     }
 }
