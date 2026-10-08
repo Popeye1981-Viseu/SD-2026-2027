@@ -9,6 +9,9 @@
       <sourceFolder url="file://$MODULE_DIR$/Sprints/Sprint1" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/Sprints/Sprint2" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/Sprints/Sprint3" isTestSource="false" />
+=======
+      <sourceFolder url="file://$MODULE_DIR$/Sprints/E1-COMINDIR01" isTestSource="false" />
+>>>>>>> upstream/master
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
