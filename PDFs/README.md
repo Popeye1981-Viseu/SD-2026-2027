@@ -13,6 +13,7 @@ Os documentos são organizados por tema, sprint ou componente da unidade curricu
 | Documento | Descrição |
 |---|---|
 | `TCP.pdf` | Resumo técnico do sprint E1-TCP01, sobre servidores TCP concorrentes em Java, serialização de objetos, tratamento de falhas e preparação para a defesa. |
+| 'Multicast_PubSub.pdf' | Resumo técnico do sprint E1-COMINDIR01, sobre Multicast e PubSub. |
 
 ## Critérios de organização
 
