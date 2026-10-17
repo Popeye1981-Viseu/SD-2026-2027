@@ -10,166 +10,169 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 
+// Líder de uma partição: atribui os números de sequência, escreve no seu ficheiro,
+// publica os registos para as réplicas e atende pedidos de recuperação por TCP.
+// Execução: PartitionLeader <k> <N> [endereço] [api]
 public class PartitionLeader {
 
-    private final int k;
-    private final int N;
-    private final String enderecoAnunciado;
-    private final int portoRecuperacao;
-    private final RecordFile file;
-    private final IpfsPubSub ps;
+    // ESTADO PARTILHADO entre as duas atividades: o último seq atribuído (e já escrito).
+    // A thread de entrada lê-o e escreve-o; a thread de recuperação só o lê.
+    private static long ultimoSeq;
 
-    // Estado partilhado pelas duas atividades (entrada e recuperação).
-    // A atribuição do seq e o append acontecem na MESMA secção sincronizada.
-    private final Object lock = new Object();
-    private long ultimoSeq;
+    // trinco que protege ultimoSeq e garante que seq + append acontecem juntos
+    private static final Object LOCK = new Object();
 
-    public PartitionLeader(int k, int N, String endereco, String api) throws IOException {
-        this.k = k;
-        this.N = N;
-        this.enderecoAnunciado = endereco;
-        this.portoRecuperacao = Wire.PORTO_BASE + k;
-        this.file = new RecordFile("lider-p" + k + ".txt");
-        this.ps = new IpfsPubSub(api);
-        this.ultimoSeq = file.lastSeq();
-    }
-
-    public static void main(String[] args) throws Exception {
+    public static void main(String[] args) throws IOException {
         if (args.length < 2) {
-            System.err.println("Uso: PartitionLeader <k> <N> [endereço] [api]");
-            System.exit(1);
+            System.out.println("Uso: PartitionLeader <k> <N> [endereço] [api]");
+            return;
         }
-        int k = Integer.parseInt(args[0]);
-        int N = Integer.parseInt(args[1]);
+        int k = Integer.parseInt(args[0]);                              // partição deste líder
+        Partitioner part = new Partitioner(Integer.parseInt(args[1]));  // função de partição com N partições
+        // endereço que o líder ANUNCIA às réplicas (127.0.0.1 por omissão)
         String endereco = args.length > 2 ? args[2] : "127.0.0.1";
         String api = args.length > 3 ? args[3] : "http://127.0.0.1:5001/api/v0";
-        new PartitionLeader(k, N, endereco, api).run();
-    }
 
-    public void run() throws Exception {
-        System.out.println("Líder p" + k + ": lastSeq() = " + ultimoSeq
-                + ", anuncia " + enderecoAnunciado + ":" + portoRecuperacao
-                + ", subscreve " + Wire.topicIn(k) + ", publica em " + Wire.topicData(k));
+        IpfsPubSub ps = new IpfsPubSub(api);
+        RecordFile file = new RecordFile("lider-p" + k + ".txt");
+        int porto = Wire.PORTO_BASE + k;          // porto de recuperação: 7000 + k
 
-        // ---------- atividade 1: entrada (thread dedicada) ----------
-        Thread entrada = new Thread(this::loopEntrada, "entrada-p" + k);
-        entrada.setDaemon(true);
+        // seq inicial obtido com lastSeq(), como na COMINDIR01 (permite reiniciar o líder)
+        ultimoSeq = file.lastSeq();
+        System.out.println("Líder p" + k + " (N=" + part.count() + ") | último seq=" + ultimoSeq
+                + " | recuperação em " + endereco + ":" + porto);
+
+        // ATIVIDADE DE ENTRADA: thread própria, bloqueia dentro de subscribe
+        Thread entrada = new Thread(() -> {
+            try {
+                // cada mensagem recebida em rep02-in-p<k> é tratada por tratarEntrada
+                ps.subscribe(Wire.topicIn(k),
+                        msg -> tratarEntrada(msg, k, part, ps, file, endereco, porto));
+            } catch (IOException | InterruptedException e) {
+                System.out.println("Subscrição de entrada terminou: " + e.getMessage());
+            }
+        });
         entrada.start();
 
-        // ---------- atividade 2: servidor de recuperação (thread principal) ----------
-        try (ServerSocket server = new ServerSocket(portoRecuperacao)) {
-            System.out.println("Servidor de recuperação à escuta no porto " + portoRecuperacao);
+        // ATIVIDADE DE RECUPERAÇÃO: thread principal, atende as ligações uma de cada vez
+        try (ServerSocket server = new ServerSocket(porto)) {
             while (true) {
-                try (Socket s = server.accept();
+                try (Socket s = server.accept();   // bloqueia até uma réplica se ligar
                      BufferedReader in = new BufferedReader(
                              new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
                      PrintWriter out = new PrintWriter(
                              new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8), true)) {
-                    s.setSoTimeout(Wire.T_TCP_MS);
-                    atender(s, in, out);
+                    s.setSoTimeout(Wire.T_TCP_MS);  // não espera indefinidamente pelo pedido
+                    String remoto = s.getRemoteSocketAddress().toString();
+                    String pedido = in.readLine();   // bloqueia até chegar o pedido
+                    atenderPedido(pedido, file, out, remoto);
                 } catch (IOException e) {
+                    // uma falha numa ligação termina só essa ligação
                     System.out.println("Recuperação interrompida: " + e.getMessage());
                 }
             }
         }
     }
 
-    // ---------- atividade de entrada ----------
-    private void loopEntrada() {
+    // Trata uma mensagem do tópico de entrada: IN;<sensor>;<temperatura>
+    private static void tratarEntrada(String msg, int k, Partitioner part, IpfsPubSub ps,
+                                      RecordFile file, String endereco, int porto) {
+        SensorRecord r;
         try {
-            ps.subscribe(Wire.topicIn(k), this::onIn);
-        } catch (IOException | InterruptedException e) {
-            System.err.println("Subscrição da entrada terminou: " + e.getMessage());
-        }
-    }
-
-    private void onIn(String msg) {
-        try {
-            if (!"IN".equals(Wire.type(msg))) {
-                System.out.println("REJEITADO: " + msg);
-                return;
+            // validar o formato; qualquer problema lança IllegalArgumentException
+            if (!Wire.type(msg).equals("IN")) {
+                throw new IllegalArgumentException("tipo não é IN");
             }
             String[] f = Wire.body(msg).split(";");
-            if (f.length != 2) {
-                System.out.println("REJEITADO: " + msg);
-                return;
+            if (f.length != 2 || f[0].isBlank()) {
+                throw new IllegalArgumentException("esperado IN;<sensor>;<temperatura>");
             }
-            String sensor = f[0];
-            double temp;
-            try {
-                temp = Double.parseDouble(f[1]);
-            } catch (NumberFormatException e) {
-                System.out.println("REJEITADO: " + msg);
+            String sensor = f[0].trim();
+            double temp = Double.parseDouble(f[1].trim());   // NumberFormatException é IllegalArgumentException
+
+            // PASSO 9: o sensor tem de pertencer a esta partição; se não, não é registado
+            int j = part.of(sensor);
+            if (j != k) {
+                System.out.println("PARTIÇÃO ERRADA: " + sensor + " pertence a p" + j);
                 return;
             }
 
-            // (Parte B) verificação de partição — descomentar quando existir Partitioner:
-            // if (new Partitioner(N).of(sensor) != k) {
-            //     System.out.println("PARTIÇÃO ERRADA: " + sensor + " pertence a p" + ...);
-            //     return;
-            // }
-
-            // secção sincronizada: atribuir seq E escrever localmente ANTES de propagar
-            SensorRecord r;
-            synchronized (lock) {
-                long seq = ++ultimoSeq;
+            // SECÇÃO CRÍTICA: atribuição do seq e append na mesma secção sincronizada
+            synchronized (LOCK) {
+                long seq = ultimoSeq + 1;
                 r = SensorRecord.now(seq, sensor, temp);
-                file.append(r);
+                file.append(r);     // se a escrita falhar, ultimoSeq não avança
+                ultimoSeq = seq;    // só agora o registo fica visível para a recuperação
             }
+        } catch (IllegalArgumentException e) {
+            // mensagem inválida: rejeitada, o líder continua
+            System.out.println("REJEITADO: " + msg.trim());
+            return;
+        } catch (IOException e) {
+            System.out.println("Erro a escrever no ficheiro: " + e.getMessage());
+            return;
+        }
 
-            ps.publish(Wire.topicData(k),
-                    Wire.reg(enderecoAnunciado, portoRecuperacao, r));
+        // ESCREVER LOCALMENTE, DEPOIS PROPAGAR: o registo já está no ficheiro,
+        // por isso qualquer réplica que dê pela falta dele pode pedi-lo por TCP
+        try {
+            ps.publish(Wire.topicData(k), Wire.reg(endereco, porto, r));
+            System.out.println("Registado e enviado: " + r.toLine());
         } catch (IOException | InterruptedException e) {
-            System.err.println("Falha a tratar IN: " + e.getMessage());
-        } catch (RuntimeException e) {
-            System.out.println("REJEITADO: " + msg + " (" + e.getMessage() + ")");
+            System.out.println("Registado mas não enviado (" + r.getSeq() + "): " + e.getMessage());
         }
     }
 
-    // ---------- atividade de recuperação ----------
-    private void atender(Socket s, BufferedReader in, PrintWriter out) throws IOException {
-        String pedido = in.readLine();
+    // Atende um pedido de recuperação: PEDIDO <de> <até>
+    private static void atenderPedido(String pedido, RecordFile file, PrintWriter out, String remoto)
+            throws IOException {
         if (pedido == null) {
-            out.println("ERRO pedido vazio");
+            // a réplica fechou a ligação sem enviar o pedido
+            System.out.println("Ligação de " + remoto + " fechada sem pedido");
             return;
         }
-        String[] partes = pedido.trim().split("\\s+");
-        if (partes.length != 3 || !"PEDIDO".equals(partes[0])) {
-            out.println("ERRO pedido mal formado");
-            return;
-        }
+
+        // validar o formato "PEDIDO <de> <até>"
         long de, ate;
+        String[] p = pedido.trim().split("\\s+");
         try {
-            de = Long.parseLong(partes[1]);
-            ate = Long.parseLong(partes[2]);
-        } catch (NumberFormatException e) {
-            out.println("ERRO limites inválidos");
+            if (p.length != 3 || !p[0].equals("PEDIDO")) {
+                throw new IllegalArgumentException();
+            }
+            de = Long.parseLong(p[1]);
+            ate = Long.parseLong(p[2]);
+        } catch (IllegalArgumentException e) {
+            out.println("ERRO esperado PEDIDO <de> <até>");
+            System.out.println("Pedido mal formado de " + remoto + ": " + pedido);
             return;
         }
+        // a ficha pede ERRO para pedido mal formado ou de > até
         if (de > ate) {
-            out.println("ERRO de > até");
+            out.println("ERRO intervalo inválido " + de + ".." + ate);
+            System.out.println("Intervalo inválido de " + remoto + ": " + pedido);
             return;
         }
 
-        long topo;
-        synchronized (lock) {
-            topo = Math.min(ate, ultimoSeq);
+        // limitar 'até' ao último seq escrito (leitura do estado partilhado, protegida)
+        long ultimo;
+        synchronized (LOCK) {
+            ultimo = ultimoSeq;
         }
+        long ateEfetivo = Math.min(ate, ultimo);
 
-        String remoto = String.valueOf(s.getRemoteSocketAddress());
-
-        if (de > topo) {
-            out.println("FIM");
-            System.out.println("RECUPERAÇÃO: " + de + ".." + ate + " para " + remoto + " (0 registos)");
-            return;
+        // o ficheiro do líder é a FONTE da recuperação; range é synchronized no RecordFile,
+        // por isso nunca lê o ficheiro a meio de um append
+        List<SensorRecord> regs = file.range(de, ateEfetivo);
+        for (SensorRecord r : regs) {
+            out.println(r.toLine());     // uma linha por registo: seq;sensor;temperatura;instante
         }
+        out.println("FIM");              // fim da resposta; a ligação fecha ao sair do try
 
-        List<SensorRecord> recs = file.range(de, topo);
-        for (SensorRecord r : recs) {
-            out.println(r.toLine());
+        // o PrintWriter não lança exceções: verifica se a escrita falhou
+        if (out.checkError()) {
+            throw new IOException("ligação interrompida durante a resposta a " + remoto);
         }
-        out.println("FIM");
-        System.out.println("RECUPERAÇÃO: " + de + ".." + topo + " para " + remoto
-                + " (" + recs.size() + " registos)");
+        System.out.println("RECUPERAÇÃO: " + de + ".." + ateEfetivo + " para " + remoto
+                + " (" + regs.size() + " registos)");
     }
 }
