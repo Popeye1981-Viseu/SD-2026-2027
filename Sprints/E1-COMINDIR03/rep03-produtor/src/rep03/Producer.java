@@ -103,6 +103,9 @@ public class Producer {
             long agora = System.currentTimeMillis();
             if (i == 0) primeira = agora;                // instante da primeira publicação
             ultima = agora;                              // no fim do ciclo fica o da última
+
+            // NOVO: Pausa de 5 ms para o IPFS não bloquear por excesso de tráfego
+            Thread.sleep(5);
         }
 
         // instantes da primeira e da última publicação (usados nas medições do ponto 16)
