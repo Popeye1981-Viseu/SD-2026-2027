@@ -16,7 +16,8 @@ Os documentos são organizados por tema, sprint ou componente da unidade curricu
 | `UDP_2.pdf` | Resumo técnico do Sprint E1-UDP02, sobre protocolo UDP. Mas com algoritmo para registos Duplicados e fora de ordem. |
 | `TCP.pdf` | Resumo técnico do sprint E1-TCP01, sobre servidores TCP concorrentes em Java, serialização de objetos, tratamento de falhas e preparação para a defesa. |
 | `Multicast_PubSub.pdf` | Resumo técnico do sprint E1-COMINDIR01, sobre Multicast e PubSub. |
-| `Particionamento_Recuperacao_PubSub.pdf` | Resumo técnico do sprint E!-COMINDIR02, sobre Particionamento e Recuperação em PubSub. |
+| `Particionamento_Recuperacao_PubSub.pdf` | Resumo técnico do sprint E1-COMINDIR02, sobre Particionamento e Recuperação em PubSub. |
+| `Relogios_Log_Relogios_Vet.pdf` | Resumo técnico do Sprint E1-COMINDIR03, sobre Relógios Lógicos e Vetoriais sobre Partições. |
 
 ## Critérios de organização
 
