@@ -1,0 +1,13 @@
+# Ignorar pastas de compilação
+out/
+*.class
+
+# Ignorar ficheiros de dados e logs gerados pelos ensaios
+rep04-lider/*.txt
+rep04-processador/*.txt
+rep04-produtor/*.txt
+rep04-replica/*.txt
+*.txt
+
+# Ignorar scripts locais
+*.sh
