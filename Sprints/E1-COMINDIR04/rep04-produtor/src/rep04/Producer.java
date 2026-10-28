@@ -84,7 +84,8 @@ public class Producer {
 
             try {
                 if (p[0].equals("sair")) {
-                    break;
+                    System.out.println("A sair do produtor...");
+                    System.exit(0);
 
                 } else if (p[0].equals("rajada") && p.length == 3) {
                     rajada(ps, part, rnd, Integer.parseInt(p[1]), Integer.parseInt(p[2]), false);
