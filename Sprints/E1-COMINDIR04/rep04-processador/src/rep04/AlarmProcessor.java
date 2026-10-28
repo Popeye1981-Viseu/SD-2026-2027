@@ -1,10 +1,16 @@
 package rep04;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public class AlarmProcessor {
 
@@ -15,8 +21,10 @@ public class AlarmProcessor {
     private final Partitioner part;
     private final IpfsPubSub pubsub;
 
-    // CORRIGIDO: Apenas a declaração, sem inicialização com 'n'
     private final Set<Long>[] seenSeqs;
+
+    // NOVO: Monitores de heartbeat por partição
+    private final HeartbeatMonitor[] monitores;
 
     @SuppressWarnings("unchecked")
     public AlarmProcessor(int n, String api) {
@@ -25,10 +33,11 @@ public class AlarmProcessor {
         this.part = new Partitioner(n);
         this.pubsub = new IpfsPubSub(api);
 
-        // CORRIGIDO: Inicialização do array dentro do construtor, onde o 'n' já é conhecido
         this.seenSeqs = new Set[n];
+        this.monitores = new HeartbeatMonitor[n];
         for (int i = 0; i < n; i++) {
             this.seenSeqs[i] = ConcurrentHashMap.newKeySet();
+            this.monitores[i] = new HeartbeatMonitor(i, Wire.PERIODO_HB_MS, Wire.FATOR_TIMEOUT, this::registarMonitor);
         }
     }
 
@@ -45,6 +54,14 @@ public class AlarmProcessor {
     }
 
     private void run() {
+        // NOVO: Agendador para verificar os timeouts
+        ScheduledExecutorService verificador = Executors.newSingleThreadScheduledExecutor();
+        verificador.scheduleAtFixedRate(() -> {
+            for (HeartbeatMonitor m : monitores) {
+                m.check();
+            }
+        }, Wire.VERIFICACAO_MS, Wire.VERIFICACAO_MS, TimeUnit.MILLISECONDS);
+
         List<Thread> threads = new ArrayList<>();
         for (int k = 0; k < n; k++) {
             final int kk = k;
@@ -68,57 +85,77 @@ public class AlarmProcessor {
         }
     }
 
+    // ALTERADO: Agora recebe e descodifica o LOTE
     private void receber(int k, String msg) {
-        if (!Wire.type(msg).equals("REG")) {
-            return;
-        }
-
-        SensorRecord r;
+        Batch batch;
         try {
-            String[] partes = Wire.regParts(msg);
-            r = SensorRecord.fromLine(partes[2], n);
+            batch = Batch.decode(msg, n);
         } catch (IllegalArgumentException e) {
-            System.out.println("REJEITADO no processador: " + msg);
+            System.out.println("REJEITADO no processador: " + e.getMessage());
             return;
         }
 
-        // Ignora registos que já são alarmes
-        if (r.getSensorId().startsWith("ALARM-")) {
-            return;
-        }
+        // 1. Atualiza o monitor de heartbeat
+        monitores[k].onHeartbeat(batch.inc, batch.hb);
 
-        // Ignora duplicados (mesma partição e mesmo seq)
-        if (!seenSeqs[k].add(r.getSeq())) {
-            return;
-        }
+        // ADICIONAR ESTAS LINHAS:
+        String seqs = batch.records.isEmpty() ? "vazio" : batch.records.get(0).seq + ".." +
+                batch.records.get(batch.records.size() - 1).seq;
+        registarMonitor("RECEBIDO;p" + k + ";inc=" + batch.inc + ",hb=" + batch.hb +
+                ",ultimoSeq=" + batch.lastSeq + ",n=" + batch.records.size() + ",seqs=" + seqs);
 
-        String alarmMsg = null;
-        int targetPartition = -1;
+        // 2. Processa os registos contidos no lote
+        for (SensorRecord r : batch.records) {
+            if (r.getSensorId().startsWith("ALARM-")) {
+                continue; // Ignora registos que já são alarmes
+            }
 
-        synchronized (lock) {
-            // Atualiza com o máximo de todos os registos recebidos
-            lamport = Math.max(lamport, r.lamport);
-            vector.merge(r.vector);
+            // Ignora duplicados (mesma partição e mesmo seq)
+            if (!seenSeqs[k].add(r.getSeq())) {
+                continue;
+            }
 
-            // Verifica se dispara alarme
-            if (r.getTemperature() >= Wire.LIMIAR_ALARME) {
-                String alarmSensor = "ALARM-" + r.getSensorId();
-                targetPartition = part.of(alarmSensor);
+            String alarmMsg = null;
+            int targetPartition = -1;
 
-                // Constrói a mensagem com os carimbos atuais (V usa copy() para não sofrer mutações futuras)
-                alarmMsg = Wire.in(alarmSensor, r.getTemperature(), lamport, vector.copy());
+            synchronized (lock) {
+                lamport = Math.max(lamport, r.lamport);
+                vector.merge(r.vector);
 
-                System.out.println("ALARME: " + r.getSensorId() + " p" + k + "#" + r.getSeq() + " → p" + targetPartition);
+                if (r.getTemperature() >= Wire.LIMIAR_ALARME) {
+                    String alarmSensor = "ALARM-" + r.getSensorId();
+                    targetPartition = part.of(alarmSensor);
+
+                    alarmMsg = Wire.in(alarmSensor, r.getTemperature(), lamport, vector.copy());
+
+                    System.out.println("ALARME: " + r.getSensorId() + " p" + k + "#" + r.getSeq() + " → p" + targetPartition);
+                }
+            }
+
+            // Publica fora da secção crítica
+            if (alarmMsg != null) {
+                // NOVO: Aviso se o líder da partição de destino estiver suspeito
+                if (monitores[targetPartition].state() == HeartbeatMonitor.State.SUSPEITO) {
+                    registarMonitor("AVISO: líder p" + targetPartition + " suspeito; alarme " + r.getSensorId() + " pode perder-se");
+                }
+                try {
+                    pubsub.publish(Wire.topicIn(targetPartition), alarmMsg);
+                } catch (IOException | InterruptedException e) {
+                    System.out.println("Erro ao publicar alarme: " + e.getMessage());
+                }
             }
         }
+    }
 
-        // Publica fora da secção crítica para não bloquear as outras threads
-        if (alarmMsg != null) {
-            try {
-                pubsub.publish(Wire.topicIn(targetPartition), alarmMsg);
-            } catch (IOException | InterruptedException e) {
-                System.out.println("Erro ao publicar alarme: " + e.getMessage());
-            }
+    // NOVO: Método para escrever no ficheiro monitor-processador.txt
+    private synchronized void registarMonitor(String evento) {
+        String linha = System.currentTimeMillis() + ";" + evento;
+        System.out.println(linha);
+        try {
+            Files.writeString(Paths.get("monitor-processador.txt"), linha + "\n",
+                    StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            System.out.println("Erro a escrever no monitor do processador: " + e.getMessage());
         }
     }
 }

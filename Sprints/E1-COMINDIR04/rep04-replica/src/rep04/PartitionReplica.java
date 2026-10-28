@@ -8,6 +8,11 @@ import java.io.PrintWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import java.util.TreeMap;
 import java.util.concurrent.Executors;
@@ -31,14 +36,13 @@ public class PartitionReplica {
             });
 
     public static void main(String[] args) throws IOException {
-        // ALTERADO: Agora exige pelo menos 3 argumentos: id, N e as partições
         if (args.length < 3) {
             System.out.println("Uso: PartitionReplica <id> <N> <partições> [portoApi]");
             return;
         }
         String id = args[0];
-        int n = Integer.parseInt(args[1]);                // LÊ O N DOS ARGUMENTOS
-        String[] particoes = args[2].split(",");          // ex.: "0,1"
+        int n = Integer.parseInt(args[1]);
+        String[] particoes = args[2].split(",");
         String portoApi = args.length > 3 ? args[3] : "5001";
         String api = "http://127.0.0.1:" + portoApi + "/api/v0";
 
@@ -46,16 +50,24 @@ public class PartitionReplica {
         descartar = Long.parseLong(System.getProperty("descartar", "-1"));
 
         IpfsPubSub ps = new IpfsPubSub(api);
+        ScheduledExecutorService verificador = Executors.newSingleThreadScheduledExecutor();
+
+        // NOVO: Garantir que os agendadores são encerrados quando a JVM termina
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("A encerrar réplica e a fechar os agendadores...");
+            SCHED.shutdownNow();
+            verificador.shutdownNow();
+        }));
 
         for (String s : particoes) {
             int k = Integer.parseInt(s.trim());
-            // Passa o N (lido dos args) para o RecordFile e para a Particao
-            Particao p = new Particao(k, new RecordFile("replica-" + id + "-p" + k + ".txt", n), n);
+            Particao p = new Particao(id, k, new RecordFile("replica-" + id + "-p" + k + ".txt", n), n);
 
             System.out.println("Réplica PubSub " + id + " subscrita ao tópico " + Wire.topicData(k)
                     + " (API: " + api + ", último seq = " + p.ultimo + ")");
 
             SCHED.scheduleAtFixedRate(p::verificarFimRajada, 200, 200, TimeUnit.MILLISECONDS);
+            verificador.scheduleAtFixedRate(p::verificarMonitor, Wire.VERIFICACAO_MS, Wire.VERIFICACAO_MS, TimeUnit.MILLISECONDS);
 
             Thread t = new Thread(() -> {
                 try {
@@ -69,13 +81,19 @@ public class PartitionReplica {
     }
 
     private static class Particao {
+        final String id;
         final int k;
         final RecordFile file;
-        final int n;                    // Número de partições
+        final int n;
         long ultimo;
         final TreeMap<Long, SensorRecord> retidos = new TreeMap<>();
         String hostLider;
         int portoLider;
+
+        final HeartbeatMonitor monitor;
+
+        // NOVO: Flag para evitar recuperações concorrentes sem bloquear a receção
+        boolean emRecuperacao = false;
 
         boolean rajadaAtiva = false;
         long t0;
@@ -88,51 +106,68 @@ public class PartitionReplica {
         int ligacoesFalhadas;
         int recuperados;
 
-        Particao(int k, RecordFile file, int n) throws IOException {
+        Particao(String id, int k, RecordFile file, int n) throws IOException {
+            this.id = id;
             this.k = k;
             this.file = file;
             this.n = n;
             this.ultimo = file.lastSeq();
+            this.monitor = new HeartbeatMonitor(k, Wire.PERIODO_HB_MS, Wire.FATOR_TIMEOUT, this::registarMonitor);
+        }
+
+        synchronized void verificarMonitor() {
+            monitor.check();
         }
 
         synchronized void receber(String msg) {
-            SensorRecord r;
-            String host;
-            int porto;
+            Batch batch;
             try {
-                if (!Wire.type(msg).equals("REG")) {
-                    throw new IllegalArgumentException("tipo não é REG");
-                }
-                String[] partes = Wire.regParts(msg);
-                host = partes[0];
-                porto = Integer.parseInt(partes[1]);
-                r = SensorRecord.fromLine(partes[2], n);
+                batch = Batch.decode(msg, n);
             } catch (IllegalArgumentException e) {
-                System.out.println("REJEITADO: " + msg);
+                System.out.println("LOTE REJEITADO: " + msg + " | " + e.getMessage());
                 return;
             }
+
+            monitor.onHeartbeat(batch.inc, batch.hb);
+
+            String seqs = batch.records.isEmpty() ? "vazio" :
+                    batch.records.get(0).seq + ".." + batch.records.get(batch.records.size() - 1).seq;
+            registarMonitor("RECEBIDO;p" + k + ";inc=" + batch.inc + ",hb=" + batch.hb +
+                    ",ultimoSeq=" + batch.lastSeq + ",n=" + batch.records.size() + ",seqs=" + seqs);
 
             marcarAtividade();
-            recebidos++;
+            hostLider = batch.address;
+            portoLider = batch.port;
 
-            if (r.getSeq() == descartar && jaDescartou.compareAndSet(false, true)) {
-                descartados++;
-                System.out.println("DESCARTADO (simulação): " + r.getSeq());
-                return;
+            for (SensorRecord r : batch.records) {
+                recebidos++;
+                if (r.getSeq() == descartar && jaDescartou.compareAndSet(false, true)) {
+                    descartados++;
+                    System.out.println("DESCARTADO (simulação): " + r.getSeq());
+                    continue;
+                }
+                if (perda > 0 && RND.nextDouble() < perda) {
+                    descartados++;
+                    System.out.println("DESCARTADO (simulação): " + r.getSeq());
+                    continue;
+                }
+                aplicar(r);
             }
-            if (perda > 0 && RND.nextDouble() < perda) {
-                descartados++;
-                System.out.println("DESCARTADO (simulação): " + r.getSeq());
-                return;
-            }
 
-            hostLider = host;
-            portoLider = porto;
-
-            aplicar(r);
-
-            if (retidos.size() > Wire.LIMITE_RETIDOS) {
-                recuperar();
+            // ATUALIZADO: Verifica lacuna e lança thread sem bloquear o trinco
+            if ((ultimo < batch.lastSeq || retidos.size() > Wire.LIMITE_RETIDOS) && !emRecuperacao) {
+                long de = ultimo + 1;
+                long ate = batch.lastSeq;
+                if (!retidos.isEmpty() && retidos.firstKey() > de) {
+                    ate = Math.min(ate, retidos.firstKey() - 1);
+                }
+                if (de <= ate) {
+                    emRecuperacao = true;
+                    registarMonitor("RECUPERACAO;p" + k + ";de=" + de + ";ate=" + ate);
+                    final long fDe = de;
+                    final long fAte = ate;
+                    new Thread(() -> executarRecuperacao(fDe, fAte)).start();
+                }
             }
         }
 
@@ -175,12 +210,9 @@ public class PartitionReplica {
             }
         }
 
-        void recuperar() {
-            long de = ultimo + 1;
-            long ate = retidos.firstKey() - 1;
-            ligacoes++;
-            System.out.println("RECUPERAÇÃO: " + de + ".." + ate + " pedida a " + hostLider + ":" + portoLider);
-
+        // NOVO: Recuperação assíncrona que não bloqueia a receção de heartbeats
+        void executarRecuperacao(long de, long ate) {
+            List<SensorRecord> temporarios = new ArrayList<>();
             try (Socket s = new Socket()) {
                 s.connect(new InetSocketAddress(hostLider, portoLider), Wire.T_TCP_MS);
                 s.setSoTimeout(Wire.T_TCP_MS);
@@ -202,17 +234,28 @@ public class PartitionReplica {
                     if (linha.startsWith("ERRO")) {
                         throw new IOException("líder respondeu " + linha);
                     }
-                    SensorRecord r = SensorRecord.fromLine(linha, n);
-                    recuperados++;
-                    System.out.println("RECUPERADO: " + r.getSeq());
-                    aplicar(r);
+                    temporarios.add(SensorRecord.fromLine(linha, n));
                 }
                 if (!fim) {
                     throw new IOException("resposta interrompida antes de FIM");
                 }
+
+                // Só aplica se recebeu tudo com sucesso
+                synchronized (this) {
+                    for (SensorRecord r : temporarios) {
+                        retidos.put(r.getSeq(), r);
+                        recuperados++;
+                    }
+                    escreverRetidosEmSequencia();
+                }
             } catch (IOException | IllegalArgumentException e) {
                 ligacoesFalhadas++;
                 System.out.println("RECUPERAÇÃO FALHOU: " + e.getMessage());
+            } finally {
+                // Liberta a flag para futuras tentativas
+                synchronized (this) {
+                    emRecuperacao = false;
+                }
             }
         }
 
@@ -241,6 +284,17 @@ public class PartitionReplica {
                     + " | Registos obtidos por TCP=" + recuperados);
             System.out.println("Retidos em memória=" + retidos.size() + " | último seq=" + ultimo);
             rajadaAtiva = false;
+        }
+
+        synchronized void registarMonitor(String evento) {
+            String linha = System.currentTimeMillis() + ";" + evento;
+            System.out.println(linha);
+            try {
+                Files.writeString(Paths.get("monitor-replica" + id + ".txt"), linha + "\n",
+                        StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+            } catch (IOException e) {
+                System.out.println("Erro a escrever no monitor: " + e.getMessage());
+            }
         }
     }
 }
