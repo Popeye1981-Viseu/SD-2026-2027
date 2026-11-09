@@ -128,7 +128,11 @@ public class AlarmProcessor {
                     + " < " + maiorTermo[k] + " (p" + k + ")");
             return;
         }
-        maiorTermo[k] = batch.term;
+
+        // ALTERAÇÃO 3: Atribuição estritamente maior (por clareza)
+        if (batch.term > maiorTermo[k]) {
+            maiorTermo[k] = batch.term;
+        }
 
         // 2. Processa os registos contidos no lote
         for (SensorRecord r : batch.records) {
@@ -143,6 +147,7 @@ public class AlarmProcessor {
 
             String alarmMsg = null;
             int targetPartition = -1;
+            String alarmSensor = null; // ALTERAÇÃO 1: Declarado fora do synchronized para poder ser usado no aviso
 
             synchronized (lock) {
                 // fica a "saber" tudo o que este registo sabia: funde os carimbos
@@ -151,7 +156,7 @@ public class AlarmProcessor {
 
                 // se a temperatura passa o limiar, prepara um alarme
                 if (r.getTemperature() >= Wire.LIMIAR_ALARME) {
-                    String alarmSensor = "ALARM-" + r.getSensorId();
+                    alarmSensor = "ALARM-" + r.getSensorId();
                     targetPartition = part.of(alarmSensor);   // o alarme pode cair noutra partição
 
                     // o alarme leva os carimbos acumulados (cópia do vetor)
@@ -165,8 +170,9 @@ public class AlarmProcessor {
             if (alarmMsg != null) {
                 // Aviso se a partição de destino estiver sem líder conhecido (publica na mesma)
                 if (monitores[targetPartition].state() == HeartbeatMonitor.State.SUSPEITO) {
+                    // ALTERAÇÃO 1: Usar 'alarmSensor' em vez de 'r.getSensorId()'
                     registarMonitor("AVISO: partição p" + targetPartition + " sem líder conhecido; alarme "
-                            + r.getSensorId() + " pode perder-se");
+                            + alarmSensor + " pode perder-se");
                 }
                 try {
                     pubsub.publish(Wire.topicIn(targetPartition), alarmMsg);

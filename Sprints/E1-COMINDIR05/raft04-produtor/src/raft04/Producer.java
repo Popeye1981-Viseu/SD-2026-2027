@@ -144,7 +144,7 @@ public class Producer {
         ps.publish(Wire.topicIn(k), Wire.in(sensor, temp, 0L, vetorZero));
         registarEnvio(instante, k, sensor, temp);     // só chega aqui se o envio não falhou
 
-        System.out.println(sensor + " " + temp + " → p" + k);
+        // System.out.println(sensor + " " + temp + " → p" + k);
         return k;
     }
 
@@ -206,7 +206,7 @@ public class Producer {
     // Formato: <instante>;<EVENTO>;p<k>;<detalhe>   (o parâmetro k não é usado no corpo)
     private static synchronized void registarMonitor(int k, String evento) {
         String linha = System.currentTimeMillis() + ";" + evento;
-        System.out.println(linha);
+        // System.out.println(linha);
         try {
             Files.writeString(Paths.get("monitor-produtor.txt"), linha + "\n",
                     StandardOpenOption.CREATE, StandardOpenOption.APPEND);
