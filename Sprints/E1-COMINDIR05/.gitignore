@@ -1,0 +1,12 @@
+# Ignorar pastas de compilação
+out/
+*.class
+
+# Ignorar ficheiros de dados e logs gerados pelos ensaios
+raft04-no/*.txt
+raft04-processador/*.txt
+raft04-produtor/*.txt
+*.txt
+
+# Ignorar scripts locais
+*.sh
