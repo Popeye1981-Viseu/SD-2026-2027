@@ -37,6 +37,22 @@
 
     <build>
         <plugins>
+            <!--
+                Compilador moderno. Sem esta declaração, o Maven usa a versão
+                3.1 (de 2013) do super-POM, que ignora maven.compiler.release
+                e tenta compilar com source/target 1.5, originando o erro
+                "Source option 5 is no longer supported".
+                A versão 3.13.0 é a recomendada pela documentação do Maven.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>${maven.compiler.release}</release>
+                </configuration>
+            </plugin>
+
             <!-- permite arrancar com: mvn compile exec:java -Dtpf.guild=<id> -->
             <plugin>
                 <groupId>org.codehaus.mojo</groupId>
