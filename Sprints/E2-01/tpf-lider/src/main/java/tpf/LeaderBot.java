@@ -119,11 +119,6 @@ public final class LeaderBot extends ListenerAdapter {
 
     /**
      * Definição dos 7 slash commands e dos seus parâmetros.
-     *
-     * Os argumentos numéricos são declarados como STRING de propósito: se fossem
-     * INTEGER, o próprio Discord bloquearia "/config r abc" antes de chegar ao bot,
-     * e o critério de aceitação pede que seja o bot a recusar com uma mensagem de erro.
-     *
      * Nota: o Discord só aceita nomes de opções em minúsculas, por isso o parâmetro
      * <intervaloMs> de /rajada chama-se "intervalo_ms".
      */
@@ -137,11 +132,11 @@ public final class LeaderBot extends ListenerAdapter {
                 // /config r <n>: "r" é um subcomando, para permitir outros parâmetros no futuro
                 Commands.slash("config", "Altera a configuração do arquivo (admin-arquivo)")
                         .addSubcommands(new SubcommandData("r", "Altera o fator de replicação R")
-                                .addOption(OptionType.STRING, "n", "Novo valor de R (inteiro ≥ 1)", true)),
+                                .addOption(OptionType.INTEGER, "n", "Novo valor de R (inteiro ≥ 1)", true)),
 
                 Commands.slash("recuperar", "Recupera os registos de um intervalo de LSN")
-                        .addOption(OptionType.STRING, "de", "Primeiro LSN (inteiro ≥ 1)", true)
-                        .addOption(OptionType.STRING, "ate", "Último LSN (inteiro ≥ de)", true),
+                        .addOption(OptionType.INTEGER, "de", "Primeiro LSN (inteiro ≥ 1)", true)
+                        .addOption(OptionType.INTEGER, "ate", "Último LSN (inteiro ≥ de)", true),
 
                 Commands.slash("replica-token", "Gera um token de registo de réplica (admin-arquivo)"),
 
@@ -149,8 +144,8 @@ public final class LeaderBot extends ListenerAdapter {
                         .addOption(OptionType.STRING, "id", "Identificador da réplica", true),
 
                 Commands.slash("rajada", "Injeta n registos sintéticos (admin-arquivo)")
-                        .addOption(OptionType.STRING, "n", "Número de registos (inteiro ≥ 1)", true)
-                        .addOption(OptionType.STRING, "intervalo_ms", "Intervalo entre registos em ms (inteiro ≥ 0)", true));
+                        .addOption(OptionType.INTEGER, "n", "Número de registos (inteiro ≥ 1)", true)
+                        .addOption(OptionType.INTEGER, "intervalo_ms", "Intervalo entre registos em ms (inteiro ≥ 0)", true));
     }
 
     // ------------------------------------------------------------------
@@ -163,6 +158,12 @@ public final class LeaderBot extends ListenerAdapter {
      */
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent ev) {
+        // NOVO FILTRO AQUI:
+        if (!CANAL_ARQUIVO.equals(ev.getChannel().getName())) {
+            recusar(ev, "Este comando só pode ser usado no canal #" + CANAL_ARQUIVO + ".");
+            return;
+        }
+
         String nome = ev.getName();
         String autor = ev.getUser().getName();
         log("COMANDO", "/" + nome + " de " + autor);
@@ -304,17 +305,18 @@ public final class LeaderBot extends ListenerAdapter {
 
     // lê uma opção que tem de ser um inteiro no intervalo [min, max]
     static long inteiro(SlashCommandInteractionEvent ev, String nome, long min, long max) throws ArgumentoInvalido {
-        String bruto = textoObrigatorio(ev, nome);
-        long v;
-        try {
-            v = Long.parseLong(bruto);
-        } catch (NumberFormatException e) {
-            throw new ArgumentoInvalido("O argumento `" + nome + "` tem de ser um número inteiro (recebido: \""
-                    + eco(bruto) + "\").");
+        OptionMapping op = ev.getOption(nome);
+        if (op == null) {
+            throw new ArgumentoInvalido("Falta o argumento `" + nome + "`.");
         }
-        if (v < min || v > max)
-            throw new ArgumentoInvalido("O argumento `" + nome + "` tem de ser ≥ " + min
-                    + (max < Integer.MAX_VALUE ? " e ≤ " + max : "") + " (recebido: " + v + ").");
+
+        // Em vez de getAsString e parseLong, usamos getAsLong diretamente
+        long v = op.getAsLong();
+
+        if (v < min || v > max) {
+            throw new ArgumentoInvalido("O argumento `" + nome + "` tem de ser >= " + min
+                    + (max < Integer.MAX_VALUE ? " e <= " + max : "") + " (recebido: " + v + ").");
+        }
         return v;
     }
 

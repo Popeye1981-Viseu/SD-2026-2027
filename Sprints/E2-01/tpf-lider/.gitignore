@@ -23,3 +23,5 @@ out/
 *.iml
 .vscode/
 .DS_Store
+
+*.sh
