@@ -1,0 +1,27 @@
+# ---- segredos: NUNCA no repositório ----
+# token do bot Discord
+discord.token
+.env
+# master key do arquivo (gerada com head -c 32 /dev/urandom > master.key)
+master.key
+*.key
+
+# ---- dados de execução do líder (gerados nos ensaios) ----
+registos.log
+catalogo.txt
+desafios.txt
+replicas.txt
+eventos-*.txt
+selados/
+dados-*/
+
+# ---- build e IDE ----
+target/
+out/
+*.class
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+*.sh
