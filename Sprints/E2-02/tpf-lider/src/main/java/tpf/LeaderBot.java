@@ -3,10 +3,14 @@ package tpf;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
@@ -24,87 +28,134 @@ import net.dv8tion.jda.api.requests.GatewayIntent;
 import net.dv8tion.jda.api.utils.MarkdownSanitizer;
 
 /**
- * Líder do arquivo distribuído (TPF) — Sprint 1: base do bot Discord.
+ * Líder do arquivo distribuído (TPF) — Sprint E2-02: escrita local durável.
  *
- * Neste sprint o LeaderBot apenas:
- *   - regista os 7 slash commands no servidor de teste (guild commands);
- *   - identifica cada comando, lê e valida os argumentos e responde com uma
- *     mensagem provisória que ecoa os argumentos recebidos;
- *   - restringe os comandos de administração ao papel admin-arquivo;
- *   - deteta as mensagens enviadas no canal #arquivo (ignorando bots).
+ * Fluxo de um registo (único para /registar, #arquivo e /rajada):
+ *   1. LSN + linha em registos.log com fsync (fonte de verdade);
+ *   2. entra no chunk aberto;
+ *   3. o chunk é selado quando atinge Wire.CHUNK_MAX_BYTES ou Wire.SELAGEM_MS
+ *      depois do primeiro registo; selar = padding + cifra + selados/<id>.bin|.hdr
+ *      + evento SELADO.
  *
- * Nenhuma funcionalidade do arquivo (registo, cifra, réplicas, recuperação)
- * está implementada: os métodos cmdXxx são os pontos onde, nos próximos
- * sprints, se ligará o resto do líder.
+ * Só depois de (1) é que o utilizador recebe o LSN: o log é a fonte de verdade,
+ * o chunk é derivado e re-sealável a partir dele num sprint futuro.
  */
 public final class LeaderBot extends ListenerAdapter {
 
-    // nome do canal cujas mensagens são registadas (sem o '#')
     static final String CANAL_ARQUIVO = "arquivo";
-
-    // papel exigido para os comandos de configuração e de réplicas
     static final String PAPEL_ADMIN = "admin-arquivo";
 
-    // comandos que só membros com o papel admin-arquivo podem executar
     static final Set<String> COMANDOS_ADMIN =
             Set.of("config", "replica-token", "replica-remover", "rajada");
 
-    // identificador de réplica aceite: letras, dígitos, '_' e '-', até 32 caracteres
-    // (o id é usado no tópico tpf-r-<id> e na pasta dados-<id>, por isso não pode ter ';', '/', espaços...)
     static final Pattern ID_REPLICA = Pattern.compile("[A-Za-z0-9_-]{1,32}");
-
-    // tamanho máximo do texto ecoado nas respostas (o Discord limita cada mensagem a 2000 caracteres)
     static final int MAX_ECO = 200;
+    static final int MAX_RAJADA = 5000;
+
+    // ------------------------------------------------------------------
+    // Estado do líder
+    // ------------------------------------------------------------------
+
+    private final Eventos eventos;
+    private final LogRegistos log;
+    private final byte[] chaveMestra;      // 32 bytes; usada para a DEK de cada chunk
+    private final Path pastaDados;
+    private final ScheduledExecutorService agendador;
+
+    // Chunk aberto e o temporizador de selagem. Ambos só são tocados dentro de
+    // métodos synchronized nesta instância (o agendador entra pelo mesmo lock).
+    private Chunk chunkAberto;
+    private ScheduledFuture<?> selagemAgendada;
+
+    private LeaderBot(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados) {
+        this.eventos = eventos;
+        this.log = log;
+        this.chaveMestra = chaveMestra.clone();
+        this.pastaDados = pastaDados;
+        this.agendador = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "tpf-agendador");
+            t.setDaemon(true);
+            return t;
+        });
+    }
 
     // ------------------------------------------------------------------
     // Arranque
     // ------------------------------------------------------------------
 
     public static void main(String[] args) throws Exception {
-        // o token nunca está no código nem no repositório (ver lerToken)
         String token = lerToken();
-
-        // id do servidor de teste: -Dtpf.guild=<id> ou variável de ambiente TPF_GUILD_ID
         String guildId = System.getProperty("tpf.guild", System.getenv("TPF_GUILD_ID"));
         if (guildId == null || guildId.isBlank()) {
             System.err.println("Falta o id do servidor: use -Dtpf.guild=<id> ou defina TPF_GUILD_ID.");
             System.exit(1);
         }
 
-        // GUILD_MESSAGES para receber mensagens dos canais do servidor;
-        // MESSAGE_CONTENT (privileged intent, ativado no Developer Portal) para ler o texto delas
+        // 1. Raiz de confiança (fail-fast, antes de qualquer socket)
+        Path caminhoChave = Path.of(System.getProperty("tpf.masterKey", "master.key"));
+        byte[] masterKey;
+        try {
+            masterKey = Wire.carregarOuCriarMasterKey(caminhoChave);
+        } catch (Wire.MasterKeyException e) {
+            System.err.println("ERRO FATAL NO ARRANQUE: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+
+        // 2. Recuperação do log (fail-fast: cauda parcial reparada, corrupção aborta)
+        Path pastaDados = Path.of(System.getProperty("tpf.pasta", "dados-lider"));
+        Eventos eventos;
+        LogRegistos log;
+        try {
+            eventos = new Eventos(pastaDados);
+            log = LogRegistos.abrir(pastaDados, eventos);
+        } catch (IOException e) {
+            System.err.println("ERRO FATAL NO ARRANQUE: não foi possível abrir "
+                    + pastaDados.toAbsolutePath() + ": " + e.getMessage());
+            System.exit(1);
+            return;
+        } catch (LogRegistos.CorrupcaoException e) {
+            System.err.println("ERRO FATAL NO ARRANQUE: registos.log inválido: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+
+        LeaderBot lider = new LeaderBot(eventos, log, masterKey, pastaDados);
+        Runtime.getRuntime().addShutdownHook(new Thread(lider::fechar, "tpf-shutdown"));
+
+        lider.registarEvento("ARRANQUE", "master.key validada (" + masterKey.length + " bytes)");
+        lider.registarEvento("ARRANQUE", "registos.log recuperado: último LSN=" + log.ultimoLsn()
+                + (log.bytesDescartadosNaRecuperacao() > 0
+                ? ", " + log.bytesDescartadosNaRecuperacao() + " bytes de escrita parcial descartados"
+                : ", sem reparações"));
+
+        // 3. Discord (só com chave e log válidos)
         JDA jda = JDABuilder.createDefault(token)
                 .enableIntents(GatewayIntent.GUILD_MESSAGES, GatewayIntent.MESSAGE_CONTENT)
-                .addEventListeners(new LeaderBot())
+                .addEventListeners(lider)
                 .build();
 
-        // espera até o bot estar ligado e com os servidores carregados
         jda.awaitReady();
 
         Guild guild = jda.getGuildById(guildId.trim());
         if (guild == null) {
             System.err.println("O bot não pertence ao servidor " + guildId + ". Use o URL de convite do README.");
+            lider.fechar();
             jda.shutdown();
             System.exit(1);
         }
 
-        // guild commands: aparecem de imediato no servidor de teste
-        // (os comandos globais podem demorar até uma hora a propagar).
-        // updateCommands() substitui todos os comandos anteriores do bot neste servidor.
         guild.updateCommands()
                 .addCommands(definirComandos())
                 .queue(
-                        cmds -> log("COMANDOS", cmds.size() + " comandos registados em " + guild.getName()),
-                        erro -> log("ERRO", "falha ao registar os comandos: " + erro.getMessage()));
+                        cmds -> lider.registarEvento("COMANDOS",
+                                cmds.size() + " comandos registados em " + guild.getName()),
+                        erro -> lider.registarEvento("ERRO",
+                                "falha ao registar os comandos: " + erro.getMessage()));
 
-        log("ARRANQUE", "líder online como " + jda.getSelfUser().getName());
+        lider.registarEvento("ARRANQUE", "líder online como " + jda.getSelfUser().getName());
     }
 
-    /**
-     * Lê o token do bot da variável de ambiente DISCORD_TOKEN ou, se não existir,
-     * do ficheiro indicado em -Dtpf.tokenFile (por omissão "discord.token").
-     * Ambos ficam fora do repositório (o ficheiro está no .gitignore).
-     */
     static String lerToken() throws IOException {
         String env = System.getenv("DISCORD_TOKEN");
         if (env != null && !env.isBlank()) return env.trim();
@@ -114,14 +165,9 @@ public final class LeaderBot extends ListenerAdapter {
 
         System.err.println("Token não encontrado: defina DISCORD_TOKEN ou crie o ficheiro " + ficheiro);
         System.exit(1);
-        return null; // nunca chega aqui
+        return null;
     }
 
-    /**
-     * Definição dos 7 slash commands e dos seus parâmetros.
-     * Nota: o Discord só aceita nomes de opções em minúsculas, por isso o parâmetro
-     * <intervaloMs> de /rajada chama-se "intervalo_ms".
-     */
     static List<CommandData> definirComandos() {
         return List.of(
                 Commands.slash("registar", "Regista um texto no arquivo")
@@ -129,7 +175,6 @@ public final class LeaderBot extends ListenerAdapter {
 
                 Commands.slash("estado", "Mostra o estado das réplicas e o número de chunks subreplicados"),
 
-                // /config r <n>: "r" é um subcomando, para permitir outros parâmetros no futuro
                 Commands.slash("config", "Altera a configuração do arquivo (admin-arquivo)")
                         .addSubcommands(new SubcommandData("r", "Altera o fator de replicação R")
                                 .addOption(OptionType.INTEGER, "n", "Novo valor de R (inteiro ≥ 1)", true)),
@@ -149,16 +194,104 @@ public final class LeaderBot extends ListenerAdapter {
     }
 
     // ------------------------------------------------------------------
-    // Slash commands
+    // Caminho ÚNICO de escrita
     // ------------------------------------------------------------------
 
     /**
-     * Ponto de entrada de todos os slash commands: verifica as permissões,
-     * encaminha para o método do comando e trata os argumentos inválidos.
+     * Registo + entrada no chunk aberto, sob o mesmo lock: a ordem dos LSN no log
+     * e no chunk é a mesma, e nenhuma selagem concorre com um append.
      */
+    private synchronized long registar(String autor, String canal, String texto) throws IOException {
+        // 1. Fonte de verdade: LSN + linha durável.
+        Registo registo = log.acrescentarRegisto(autor, canal, texto);
+
+        // 2. Entra no chunk aberto (pode selar por tamanho).
+        adicionarAoChunk(registo);
+
+        return registo.lsn();
+    }
+
+    /** Acrescenta ao chunk aberto e sela se o limite tiver sido atingido. */
+    private void adicionarAoChunk(Registo registo) throws IOException {
+        if (chunkAberto == null) {
+            chunkAberto = Chunk.novo(registo);
+            agendarSelagemPorTempo();
+        } else {
+            chunkAberto.adicionar(registo);
+        }
+
+        // "O registo que faz o chunk exceder o limite sela-o de imediato": o registo
+        // entra primeiro e só depois se sela — nunca se perde o que provocou o limite.
+        if (chunkAberto.bytes() >= Wire.CHUNK_MAX_BYTES) {
+            selarChunkAberto();
+        }
+    }
+
+    /** Agenda a selagem por tempo, contada a partir do PRIMEIRO registo do chunk. */
+    private void agendarSelagemPorTempo() {
+        cancelarSelagemAgendada();
+        final Chunk alvo = chunkAberto;
+        if (alvo == null) return;
+
+        selagemAgendada = agendador.schedule(() -> selarPorTempo(alvo),
+                Wire.SELAGEM_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /** Callback do agendador: sela só se o chunk aberto ainda for o mesmo. */
+    private synchronized void selarPorTempo(Chunk alvo) {
+        if (chunkAberto != alvo || alvo.vazio()) return;   // já foi selado por tamanho
+        try {
+            selarChunkAberto();
+        } catch (IOException e) {
+            registarEvento("ERRO", "selagem por tempo falhou (lsn " + alvo.lsnMinimo()
+                    + "-" + alvo.lsnMaximo() + "): " + e.getMessage());
+        }
+    }
+
+    private void cancelarSelagemAgendada() {
+        if (selagemAgendada != null) {
+            selagemAgendada.cancel(false);
+            selagemAgendada = null;
+        }
+    }
+
+    /**
+     * Sela o chunk aberto: padding, cifra, escrita em `selados/` e evento SELADO.
+     * O chunk só é descartado DEPOIS de estar gravado: uma falha aqui deixa-o
+     * aberto (os registos continuam duráveis em registos.log).
+     */
+    private void selarChunkAberto() throws IOException {
+        Chunk c = chunkAberto;
+        if (c == null || c.vazio()) return;
+
+        byte[] claro = c.serializarComPadding();          // múltiplo de Wire.PAD_BYTES
+
+        ChunkCrypto.Cifrado cifrado;
+        try {
+            cifrado = ChunkCrypto.cifrar(chaveMestra, claro);
+        } catch (ChunkCrypto.CifraException e) {
+            registarEvento("ERRO", "falha ao cifrar o chunk lsn=" + c.lsnMinimo() + "-"
+                    + c.lsnMaximo() + ": " + e.getMessage());
+            throw new IOException("falha ao cifrar o chunk: " + e.getMessage(), e);
+        }
+
+        Sealed selado = Sealed.gravar(pastaDados, cifrado);
+
+        chunkAberto = null;
+        cancelarSelagemAgendada();
+
+        registarEvento("SELADO", "chunkId=" + selado.chunkId()
+                + " lsn=" + c.lsnMinimo() + "-" + c.lsnMaximo()
+                + " bytes=" + claro.length                      // texto em claro, múltiplo de PAD_BYTES
+                + " cifrados=" + selado.tamanhoCifrado());      // .bin = claro + 16 (tag GCM)
+    }
+
+    // ------------------------------------------------------------------
+    // Slash commands
+    // ------------------------------------------------------------------
+
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent ev) {
-        // NOVO FILTRO AQUI:
         if (!CANAL_ARQUIVO.equals(ev.getChannel().getName())) {
             recusar(ev, "Este comando só pode ser usado no canal #" + CANAL_ARQUIVO + ".");
             return;
@@ -166,16 +299,14 @@ public final class LeaderBot extends ListenerAdapter {
 
         String nome = ev.getName();
         String autor = ev.getUser().getName();
-        log("COMANDO", "/" + nome + " de " + autor);
+        registarEvento("COMANDO", "/" + nome + " de " + autor);
 
-        // 1. comandos de administração: só para quem tem o papel admin-arquivo
         if (COMANDOS_ADMIN.contains(nome) && !eAdmin(ev.getMember())) {
-            log("RECUSADO", "/" + nome + " de " + autor + " sem o papel " + PAPEL_ADMIN);
+            registarEvento("RECUSADO", "/" + nome + " de " + autor + " sem o papel " + PAPEL_ADMIN);
             recusar(ev, "Não tem permissão para usar `/" + nome + "`: é preciso o papel `" + PAPEL_ADMIN + "`.");
             return;
         }
 
-        // 2. encaminhamento; cada método valida os seus argumentos
         try {
             switch (nome) {
                 case "registar"        -> cmdRegistar(ev);
@@ -188,49 +319,53 @@ public final class LeaderBot extends ListenerAdapter {
                 default                -> recusar(ev, "Comando desconhecido: `/" + nome + "`.");
             }
         } catch (ArgumentoInvalido e) {
-            // 3. argumento inválido: resposta de erro visível só para quem executou o comando
-            log("INVALIDO", "/" + nome + ": " + e.getMessage());
+            registarEvento("INVALIDO", "/" + nome + ": " + e.getMessage());
             recusar(ev, e.getMessage());
+        } catch (IOException e) {
+            registarEvento("ERRO", "/" + nome + ": falha de I/O no log/chunk: " + e.getMessage());
+            recusar(ev, log.estaBloqueado()
+                    ? "O arquivo está temporariamente indisponível: o log entrou em fail-stop"
+                    + " depois de uma falha de escrita. É preciso reiniciar o líder"
+                    + " para reparar a cauda de registos.log."
+                    : "Não foi possível gravar o registo. Tente novamente.");
         }
     }
 
     // /registar <texto>
-    private void cmdRegistar(SlashCommandInteractionEvent ev) throws ArgumentoInvalido {
+    private void cmdRegistar(SlashCommandInteractionEvent ev) throws ArgumentoInvalido, IOException {
         String texto = textoObrigatorio(ev, "texto");
-        // TODO (sprints seguintes): atribuir LSN, append a registos.log com fsync, entrar no chunk aberto
-        responder(ev, "`/registar` recebido: texto=\"" + eco(texto) + "\" (" + texto.length()
-                + " caracteres) — ainda não implementado");
+        long lsn = registar(ev.getUser().getName(), CANAL_ARQUIVO, texto);
+        responder(ev, "Registado com LSN **" + lsn + "**.");
     }
 
     // /estado
     private void cmdEstado(SlashCommandInteractionEvent ev) {
-        // TODO: estado, ocupação e nº de chunks por réplica, e nº de chunks subreplicados
-        responder(ev, "`/estado` recebido — ainda não implementado");
+        responder(ev, "`/estado` — último LSN: " + log.ultimoLsn()
+                + " · chunks selados: " + contarSelados()
+                + " · " + estadoDoChunkAberto()
+                + (log.estaBloqueado() ? " · log em fail-stop (reinicie o líder)" : "")
+                + " — réplicas ainda não implementadas");
     }
 
     // /config r <n>
     private void cmdConfig(SlashCommandInteractionEvent ev) throws ArgumentoInvalido {
-        // por agora o único subcomando é "r"
         if (!"r".equals(ev.getSubcommandName()))
             throw new ArgumentoInvalido("Subcomando desconhecido. Use `/config r <n>`.");
         long n = inteiro(ev, "n", 1, Integer.MAX_VALUE);
-        // TODO: alterar R; o reconciliador converge para o novo valor
         responder(ev, "`/config r` recebido: n=" + n + " — ainda não implementado");
     }
 
     // /recuperar <de> <ate>
     private void cmdRecuperar(SlashCommandInteractionEvent ev) throws ArgumentoInvalido {
-        long de = inteiro(ev, "de", 1, Long.MAX_VALUE);   // os LSN começam em 1
+        long de = inteiro(ev, "de", 1, Long.MAX_VALUE);
         long ate = inteiro(ev, "ate", 1, Long.MAX_VALUE);
         if (de > ate)
             throw new ArgumentoInvalido("Intervalo inválido: `de` (" + de + ") tem de ser ≤ `ate` (" + ate + ").");
-        // TODO: Recovery.recuperar(de, ate)
         responder(ev, "`/recuperar` recebido: de=" + de + ", ate=" + ate + " — ainda não implementado");
     }
 
     // /replica-token
     private void cmdReplicaToken(SlashCommandInteractionEvent ev) {
-        // TODO: PubSubHub.gerarToken() (uso único, válido 10 minutos)
         responder(ev, "`/replica-token` recebido — ainda não implementado");
     }
 
@@ -240,62 +375,93 @@ public final class LeaderBot extends ListenerAdapter {
         if (!ID_REPLICA.matcher(id).matches())
             throw new ArgumentoInvalido("Identificador de réplica inválido: \"" + eco(id)
                     + "\" (use só letras, dígitos, `_` e `-`, até 32 caracteres).");
-        // TODO: remover a réplica de replicas.txt e repor R nos seus chunks
         responder(ev, "`/replica-remover` recebido: id=" + id + " — ainda não implementado");
     }
 
     // /rajada <n> <intervaloMs>
     private void cmdRajada(SlashCommandInteractionEvent ev) throws ArgumentoInvalido {
-        long n = inteiro(ev, "n", 1, Integer.MAX_VALUE);
+        long n = inteiro(ev, "n", 1, MAX_RAJADA);
         long intervalo = inteiro(ev, "intervalo_ms", 0, Integer.MAX_VALUE);
-        // TODO: injetar n registos sintéticos pelo mesmo caminho dos registos reais
-        responder(ev, "`/rajada` recebido: n=" + n + ", intervaloMs=" + intervalo + " — ainda não implementado");
+        String autor = ev.getUser().getName();
+
+        ev.deferReply().queue(
+                ok -> agendador.execute(() -> executarRajada(ev, autor, n, intervalo)),
+                erro -> registarEvento("ERRO", "falha ao adiar a resposta de /rajada: " + erro.getMessage()));
+    }
+
+    /** n registos sintéticos pelo MESMO caminho de /registar (LSN + fsync + chunk). */
+    private void executarRajada(SlashCommandInteractionEvent ev, String autor, long n, long intervalo) {
+        long primeiro = -1;
+        long ultimo = -1;
+        try {
+            for (long i = 1; i <= n; i++) {
+                if (i > 1 && intervalo > 0) Thread.sleep(intervalo);
+                long lsn = registar(autor, CANAL_ARQUIVO, "rajada " + i + "/" + n);
+                if (primeiro < 0) primeiro = lsn;
+                ultimo = lsn;
+            }
+            ev.getHook().sendMessage("Rajada concluída: " + n + " registos, LSN " + primeiro
+                    + " a " + ultimo + ".").setAllowedMentions(List.of()).queue();
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            registarEvento("ERRO", "/rajada interrompida");
+            ev.getHook().sendMessage("❌ Rajada interrompida.").setAllowedMentions(List.of()).queue();
+
+        } catch (IOException e) {
+            registarEvento("ERRO", "/rajada: falha ao gravar: " + e.getMessage());
+            long feitos = ultimo < 0 ? 0 : ultimo - primeiro + 1;
+            ev.getHook().sendMessage("❌ Rajada interrompida depois de " + feitos + " registos.")
+                    .setAllowedMentions(List.of()).queue();
+        }
     }
 
     // ------------------------------------------------------------------
-    // Mensagens no canal #arquivo
+    // Mensagens em #arquivo
     // ------------------------------------------------------------------
 
-    /**
-     * Deteta as mensagens enviadas no canal #arquivo. Ignora bots (incluindo o
-     * próprio líder, para não responder a si mesmo), webhooks, mensagens diretas
-     * e mensagens de outros canais.
-     */
     @Override
     public void onMessageReceived(MessageReceivedEvent ev) {
-        if (ev.getAuthor().isBot() || ev.isWebhookMessage()) return;  // só pessoas
-        if (!ev.isFromGuild()) return;                                 // ignora mensagens diretas
-        if (!CANAL_ARQUIVO.equals(ev.getChannel().getName())) return;  // só #arquivo
+        if (ev.getAuthor().isBot() || ev.isWebhookMessage()) return;
+        if (!ev.isFromGuild()) return;
+        if (!CANAL_ARQUIVO.equals(ev.getChannel().getName())) return;
 
         String autor = ev.getAuthor().getName();
         String texto = ev.getMessage().getContentRaw();
-        log("MENSAGEM", "#" + CANAL_ARQUIVO + " de " + autor + ": " + texto.length() + " caracteres");
 
-        // TODO: registar(autor, canal, texto), como o /registar
-        ev.getMessage()
-                .reply("Mensagem recebida em #" + CANAL_ARQUIVO + " de " + autor + ": \"" + eco(texto)
-                        + "\" — registo ainda não implementado")
-                .mentionRepliedUser(false)   // não notifica o autor
-                .setAllowedMentions(List.of()) // o eco não pode fazer @everyone nem @menções
-                .queue();
+        try {
+            long lsn = registar(autor, CANAL_ARQUIVO, texto);
+            ev.getMessage()
+                    .reply("Registado com LSN **" + lsn + "**.")
+                    .mentionRepliedUser(false)
+                    .setAllowedMentions(List.of())
+                    .queue();
+        } catch (IOException e) {
+            registarEvento("ERRO", "#arquivo: falha ao gravar a mensagem de " + autor + ": " + e.getMessage());
+            ev.getMessage()
+                    .reply(log.estaBloqueado()
+                            ? "❌ Não foi possível registar: o log entrou em fail-stop."
+                            + " O líder tem de ser reiniciado para reparar a cauda."
+                            : "❌ Não foi possível registar a mensagem. Tente novamente.")
+                    .mentionRepliedUser(false)
+                    .setAllowedMentions(List.of())
+                    .queue();
+        }
     }
 
     // ------------------------------------------------------------------
     // Auxiliares
     // ------------------------------------------------------------------
 
-    // exceção usada para recusar um argumento inválido com uma mensagem para o utilizador
     static final class ArgumentoInvalido extends Exception {
         ArgumentoInvalido(String mensagem) { super(mensagem); }
     }
 
-    // true se o membro tem o papel admin-arquivo (os slash commands são de servidor, por isso há sempre membro)
     static boolean eAdmin(Member membro) {
         return membro != null
                 && membro.getRoles().stream().anyMatch(p -> p.getName().equalsIgnoreCase(PAPEL_ADMIN));
     }
 
-    // lê uma opção de texto obrigatória e recusa-a se estiver vazia
     static String textoObrigatorio(SlashCommandInteractionEvent ev, String nome) throws ArgumentoInvalido {
         OptionMapping op = ev.getOption(nome);
         if (op == null || op.getAsString().isBlank())
@@ -303,41 +469,76 @@ public final class LeaderBot extends ListenerAdapter {
         return op.getAsString().trim();
     }
 
-    // lê uma opção que tem de ser um inteiro no intervalo [min, max]
     static long inteiro(SlashCommandInteractionEvent ev, String nome, long min, long max) throws ArgumentoInvalido {
         OptionMapping op = ev.getOption(nome);
-        if (op == null) {
-            throw new ArgumentoInvalido("Falta o argumento `" + nome + "`.");
-        }
+        if (op == null) throw new ArgumentoInvalido("Falta o argumento `" + nome + "`.");
 
-        // Em vez de getAsString e parseLong, usamos getAsLong diretamente
         long v = op.getAsLong();
-
         if (v < min || v > max) {
             throw new ArgumentoInvalido("O argumento `" + nome + "` tem de ser >= " + min
-                    + (max < Integer.MAX_VALUE ? " e <= " + max : "") + " (recebido: " + v + ").");
+                    + (max < Long.MAX_VALUE ? " e <= " + max : "") + " (recebido: " + v + ").");
         }
         return v;
     }
 
-    // resposta provisória normal, sem menções
     static void responder(SlashCommandInteractionEvent ev, String texto) {
         ev.reply(texto).setAllowedMentions(List.of()).queue();
     }
 
-    // resposta de erro, visível apenas para quem executou o comando (ephemeral)
     static void recusar(SlashCommandInteractionEvent ev, String texto) {
-        ev.reply("❌ " + texto).setEphemeral(true).setAllowedMentions(List.of()).queue();
+        if (ev.isAcknowledged()) {
+            ev.getHook().sendMessage("❌ " + texto).setEphemeral(true).setAllowedMentions(List.of()).queue();
+        } else {
+            ev.reply("❌ " + texto).setEphemeral(true).setAllowedMentions(List.of()).queue();
+        }
     }
 
-    // texto do utilizador preparado para ser ecoado: sem formatação markdown e truncado
     static String eco(String texto) {
         String t = texto.length() > MAX_ECO ? texto.substring(0, MAX_ECO) + "…" : texto;
         return MarkdownSanitizer.escape(t);
     }
 
-    // registo provisório na consola (nos próximos sprints passa a eventos-lider.txt)
-    static void log(String evento, String detalhe) {
-        System.out.println(Instant.now().toEpochMilli() + ";" + evento + ";" + detalhe);
+    /** Descrição do chunk aberto, lida sob o lock (não bloqueia escritas por muito tempo). */
+    private synchronized String estadoDoChunkAberto() {
+        if (chunkAberto == null) return "chunk aberto: nenhum";
+        return "chunk aberto: " + chunkAberto.tamanho() + " registos, "
+                + chunkAberto.bytes() + "/" + Wire.CHUNK_MAX_BYTES + " bytes";
+    }
+
+    /** Quantos `.bin` existem em `selados/` (-1 se a pasta não puder ser lida). */
+    private long contarSelados() {
+        Path pasta = pastaDados.resolve(Sealed.PASTA);
+        if (!Files.isDirectory(pasta)) return 0;
+        try (Stream<Path> ficheiros = Files.list(pasta)) {
+            return ficheiros.filter(p -> p.getFileName().toString().endsWith(Sealed.EXT_BIN)).count();
+        } catch (IOException e) {
+            return -1;
+        }
+    }
+
+    private void registarEvento(String evento, String detalhe) {
+        eventos.registar(evento, detalhe);
+        System.out.println(evento + " " + detalhe);
+    }
+
+    /** Fecho limpo: sela o chunk pendente, fecha canais e o agendador. */
+    private synchronized void fechar() {
+        try {
+            selarChunkAberto();               // não perder o chunk aberto num shutdown limpo
+        } catch (IOException e) {
+            registarEvento("ERRO", "falha ao selar o chunk pendente no shutdown: " + e.getMessage());
+        }
+        agendador.shutdownNow();
+
+        try {
+            log.close();
+        } catch (IOException ignorada) {
+            // a terminar
+        }
+        try {
+            eventos.close();
+        } catch (IOException ignorada) {
+            // a terminar
+        }
     }
 }
