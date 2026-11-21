@@ -1,0 +1,38 @@
+## Descrição
+O objetivo deste sprint é implementar a base do líder. Inclui uma aplicação Discord configurada, associada a um servidor de teste próprio do grupo, e um `LeaderBot` em Java (JDA) que recebe e encaminha todos os comandos previstos na especificação, respondendo com uma mensagem provisória. 
+**Nenhuma funcionalidade do arquivo (registo, cifra, réplicas, recuperação) é implementada neste sprint.**
+
+## Objetivos
+1. **Aplicação no Discord Developer Portal**
+   - Criar a aplicação e o respetivo bot em https://discord.com/developers/applications
+   - Ativar o *privileged intent* **Message Content** (necessário para ler as mensagens do canal `#arquivo`)
+   - Gerar o token do bot e guardá-lo fora do repositório (variável de ambiente ou ficheiro excluído no `.gitignore`)
+2. **Servidor Discord de teste**
+   - Criar um servidor próprio do grupo
+   - Criar o canal `#arquivo` e o papel `admin-arquivo`, atribuído aos membros do grupo
+3. **Associação da aplicação ao servidor**
+   - Gerar o URL de convite (OAuth2) com os scopes `bot` e `applications.commands` e as permissões mínimas (ler/enviar mensagens, ver canais)
+   - Adicionar o bot ao servidor e confirmar que aparece online
+4. **Handling dos comandos na aplicação**
+   - Criar o projeto `tpf-lider` (Java 17+, pacote `tpf`) com a dependência JDA
+   - Criar a classe `LeaderBot` que regista os *slash commands* no servidor de teste (guild commands):
+     - `/registar <texto>`
+     - `/estado`
+     - `/config r <n>`
+     - `/recuperar <de> <ate>`
+     - `/replica-token`
+     - `/replica-remover <id>`
+     - `/rajada <n> <intervaloMs>`
+   - Implementar `onSlashCommandInteraction`, que identifica o comando, lê e valida os argumentos e responde com uma mensagem provisória (ex.: «`/recuperar` recebido: de=10, ate=20 — ainda não implementado»)
+   - Implementar `onMessageReceived`, que deteta mensagens no canal `#arquivo` (ignorando as de bots) e responde/regista de forma provisória
+   - Restringir `/config`, `/replica-token`, `/replica-remover` e `/rajada` a membros com o papel `admin-arquivo`, recusando os restantes com uma mensagem clara
+
+## Critérios de aceitação
+- [ ] O bot aparece online no servidor do grupo
+- [ ] Os 7 comandos aparecem no autocomplete do Discord com os parâmetros corretos
+- [ ] Cada comando recebe uma resposta provisória que ecoa os argumentos recebidos
+- [ ] Argumentos inválidos (ex.: `/config r abc`, `/recuperar 20 10`) são recusados com mensagem de erro
+- [ ] Um membro sem `admin-arquivo` não consegue executar os comandos de administração
+- [ ] Uma mensagem enviada em `#arquivo` é detetada pelo bot; mensagens noutros canais são ignoradas
+- [ ] O token do bot (e futuramente a `master.key`) não está no repositório; o `.gitignore` exclui-os
+- [ ] Um README curto explica como configurar o token e arrancar o líder
