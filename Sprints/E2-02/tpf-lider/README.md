@@ -595,6 +595,10 @@ Notas de desenho:
 - `texto` pode conter `;`, `\n` e tabs: é *length-prefixed*, não há escapes nem separadores.
 - Leitura direta (`Chunk.ler`) e inversa (`Chunk.lerInverso`) são implementadas em separado e
   produzem exatamente a mesma lista; a inversa é a usada em `Sealed.registos(...)`.
+- O chunk transporta `autor` e `canal` **já sanitizados**, exatamente como ficaram no log: o
+  `Registo` devolvido por `LogRegistos.acrescentarRegisto` é construído a partir dos valores
+  escritos, para que log e chunk nunca divirjam. O `texto` não é sanitizado nem aparado em
+  nenhum dos dois.
 
 #### 5.4.2. Cifra e identificação
 
@@ -698,6 +702,11 @@ Notas:
   atribuído. O limite de 5000 existe para não bloquear o agendador indefinidamente.
 - Um comando de administração recusado devolve o **nome real** do comando na mensagem
   (`Não tem permissão para usar /config: é preciso o papel admin-arquivo.`).
+- `/registar` guarda o texto **exatamente como foi submetido**, incluindo espaços e mudanças de
+  linha no início e no fim (`isBlank()` rejeita o vazio, mas nada é aparado). Só os valores que
+  são *tokens* — como o `<id>` de `/replica-remover` — são aparados antes de validados. As
+  mensagens de `#arquivo` (`getContentRaw()`) têm o mesmo tratamento, pelo que o mesmo texto
+  produz o mesmo registo por qualquer das vias.
 
 ## 8. Como verificar os critérios de aceitação
 

@@ -897,8 +897,14 @@ public final class LogRegistos implements AutoCloseable {
 
     /**
      * Atribui o LSN seguinte, acrescenta a linha a `registos.log`, força-a para o
-     * disco e devolve o registo completo (com o instante que ficou no ficheiro).
-     * É este objeto que entra no chunk aberto, para que log e chunk não divirjam.
+     * disco e devolve o registo que ficou ESCRITO: `autor` e `canal` já sanitizados,
+     * o mesmo `instante` da linha, e o `texto` original sem qualquer mutação.
+     *
+     * É este objeto que entra no chunk aberto. Como o log é a fonte de verdade, o
+     * chunk tem de transportar exatamente os valores que estão no ficheiro; devolver
+     * os valores originais faria o chunk divergir do log (ex.: autor "a;b" fica "a_b"
+     * no log e "a;b" no chunk, e o critério "abrir o chunk e obter os registos do
+     * intervalo" deixaria de ser verificável byte a byte).
      */
     public synchronized Registo acrescentarRegisto(String autor, String canalDiscord, String texto)
             throws IOException {
@@ -906,7 +912,12 @@ public final class LogRegistos implements AutoCloseable {
 
         long lsn = ultimoLsn + 1;
         Instant instante = Instant.now();
-        byte[] linha = formatar(lsn, instante, autor, canalDiscord, texto);
+
+        // `limpar` é idempotente ('_' não é substituído), por isso aplicá-la aqui e
+        // outra vez dentro de `formatar` não altera o resultado.
+        String autorLog = limpar(autor);
+        String canalLog = limpar(canalDiscord);
+        byte[] linha = formatar(lsn, instante, autorLog, canalLog, texto);
 
         long posicaoInicial = canal.tamanho();
         try {
@@ -919,13 +930,10 @@ public final class LogRegistos implements AutoCloseable {
 
         ultimoLsn = lsn;
         if (eventos != null) {
-            eventos.registar("REGISTO", "lsn=" + lsn + " autor=" + autor
-                    + " canal=" + canalDiscord + " bytes=" + linha.length);
+            eventos.registar("REGISTO", "lsn=" + lsn + " autor=" + autorLog
+                    + " canal=" + canalLog + " bytes=" + linha.length);
         }
-        // Os campos autor/canal do Registo são os ORIGINAIS (o log é que os sanitiza);
-        // a garantia de não conter ';' ou '\n' é do formato binário do chunk, que é
-        // length-prefixed.
-        return new Registo(lsn, instante, autor, canalDiscord, texto);
+        return new Registo(lsn, instante, autorLog, canalLog, texto);
     }
 
     /** Compatibilidade: devolve apenas o LSN atribuído. */

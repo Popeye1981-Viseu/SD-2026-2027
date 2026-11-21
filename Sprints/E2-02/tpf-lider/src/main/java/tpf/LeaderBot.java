@@ -39,6 +39,9 @@ import net.dv8tion.jda.api.utils.MarkdownSanitizer;
  *
  * Só depois de (1) é que o utilizador recebe o LSN: o log é a fonte de verdade,
  * o chunk é derivado e re-sealável a partir dele num sprint futuro.
+ *
+ * Texto: `isBlank()` VALIDA e `trim()` MUTA. Só se apara o que é token (ex.: o id
+ * de /replica-remover); o texto de /registar é guardado exatamente como submetido.
  */
 public final class LeaderBot extends ListenerAdapter {
 
@@ -202,7 +205,8 @@ public final class LeaderBot extends ListenerAdapter {
      * e no chunk é a mesma, e nenhuma selagem concorre com um append.
      */
     private synchronized long registar(String autor, String canal, String texto) throws IOException {
-        // 1. Fonte de verdade: LSN + linha durável.
+        // 1. Fonte de verdade: LSN + linha durável. O Registo devolvido já tem os
+        //    valores sanitizados que ficaram escritos, para o chunk não divergir do log.
         Registo registo = log.acrescentarRegisto(autor, canal, texto);
 
         // 2. Entra no chunk aberto (pode selar por tamanho).
@@ -333,7 +337,10 @@ public final class LeaderBot extends ListenerAdapter {
 
     // /registar <texto>
     private void cmdRegistar(SlashCommandInteractionEvent ev) throws ArgumentoInvalido, IOException {
-        String texto = textoObrigatorio(ev, "texto");
+        // O texto é guardado TAL COMO FOI SUBMETIDO: espaços e mudanças de linha no
+        // início/fim podem ser significativos (código, YAML, indentação). `isBlank()`
+        // rejeita o vazio sem mutar o valor.
+        String texto = textoOriginal(ev, "texto");
         long lsn = registar(ev.getUser().getName(), CANAL_ARQUIVO, texto);
         responder(ev, "Registado com LSN **" + lsn + "**.");
     }
@@ -371,6 +378,7 @@ public final class LeaderBot extends ListenerAdapter {
 
     // /replica-remover <id>
     private void cmdReplicaRemover(SlashCommandInteractionEvent ev) throws ArgumentoInvalido {
+        // Aqui o valor é um TOKEN, não conteúdo: aparar é normalização.
         String id = textoObrigatorio(ev, "id");
         if (!ID_REPLICA.matcher(id).matches())
             throw new ArgumentoInvalido("Identificador de réplica inválido: \"" + eco(id)
@@ -427,6 +435,8 @@ public final class LeaderBot extends ListenerAdapter {
         if (!CANAL_ARQUIVO.equals(ev.getChannel().getName())) return;
 
         String autor = ev.getAuthor().getName();
+        // getContentRaw() não apara nada: mesma semântica de /registar, pelo que o
+        // mesmo texto produz o mesmo registo por qualquer das vias.
         String texto = ev.getMessage().getContentRaw();
 
         try {
@@ -462,11 +472,35 @@ public final class LeaderBot extends ListenerAdapter {
                 && membro.getRoles().stream().anyMatch(p -> p.getName().equalsIgnoreCase(PAPEL_ADMIN));
     }
 
+    /** Valor que é um TOKEN (ex.: id de réplica): valida e apara. */
     static String textoObrigatorio(SlashCommandInteractionEvent ev, String nome) throws ArgumentoInvalido {
+        return lerTexto(ev, nome, true);
+    }
+
+    /** Valor que é CONTEÚDO (ex.: texto de /registar): valida sem aparar. */
+    static String textoOriginal(SlashCommandInteractionEvent ev, String nome) throws ArgumentoInvalido {
+        return lerTexto(ev, nome, false);
+    }
+
+    private static String lerTexto(SlashCommandInteractionEvent ev, String nome, boolean aparar)
+            throws ArgumentoInvalido {
         OptionMapping op = ev.getOption(nome);
-        if (op == null || op.getAsString().isBlank())
-            throw new ArgumentoInvalido("Falta o argumento `" + nome + "`.");
-        return op.getAsString().trim();
+        if (op == null) throw new ArgumentoInvalido("Falta o argumento `" + nome + "`.");
+        return validarTexto(op.getAsString(), nome, aparar);
+    }
+
+    /**
+     * Regra única de validação de texto, testável sem JDA.
+     *
+     * `isBlank()` VALIDA (rejeita o vazio e o só-espaços) e `trim()` MUTA — só se
+     * aplica quando o valor é um token. Assim `"  olá  "` em /registar fica intacto,
+     * mas `"  abc  "` em /replica-remover passa a `"abc"` antes da regex do id.
+     */
+    static String validarTexto(String valor, String nome, boolean aparar) throws ArgumentoInvalido {
+        if (valor == null || valor.isBlank()) {
+            throw new ArgumentoInvalido("O argumento `" + nome + "` não pode estar vazio.");
+        }
+        return aparar ? valor.trim() : valor;
     }
 
     static long inteiro(SlashCommandInteractionEvent ev, String nome, long min, long max) throws ArgumentoInvalido {
