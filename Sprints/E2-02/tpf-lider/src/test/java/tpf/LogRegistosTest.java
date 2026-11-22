@@ -928,4 +928,53 @@ class LogRegistosTest {
         assertEquals(0, contarEventos(pasta, "REPARACAO"),
                 "Não pode ser emitida evidência de reparação.");
     }
+
+    @Test
+    void intencaoIncompativelNaoAlteraODiarioDeEventos(@TempDir Path pasta) throws Exception {
+        // Três condições ao mesmo tempo: o log precisa de reparação, o diário tem uma
+        // cauda parcial (o primeiro alvo de escrita do arranque) e a intenção pendente
+        // é INCOMPATÍVEL com o log (descartados ≠ tamanho real da cauda).
+        byte[] l1 = linha(1, "ana", "arquivo", "primeiro");
+        byte[] l2 = linha(2, "rui", "arquivo", "segundo");
+        Files.write(ficheiro(pasta), unir(l1, cortado(l2, 10)));
+
+        byte[] diario = unir(
+                utf8("2025-01-01T00:00:00Z;ARRANQUE;ok\n"),
+                utf8("2025-01-01T00:00:01Z;REPAR"));          // cauda parcial (sem '\n')
+        Files.write(ficheiroEventos(pasta), diario);
+
+        LogRegistos.escreverIntencao(pasta, new LogRegistos.IntencaoReparacao(
+                "intent-incompativel", l1.length, 999, 1));    // 999 ≠ 10 bytes de cauda
+
+        byte[] logInicial = Files.readAllBytes(ficheiro(pasta));
+        byte[] intencaoInicial = Files.readAllBytes(ficheiroIntencao(pasta));
+
+        assertThrows(LogRegistos.CorrupcaoException.class, () -> LogRegistos.abrir(pasta, null));
+
+        assertArrayEquals(diario, Files.readAllBytes(ficheiroEventos(pasta)),
+                "o diário NÃO pode ser truncado antes de a intenção ser validada");
+        assertArrayEquals(logInicial, Files.readAllBytes(ficheiro(pasta)),
+                "o log não pode ser truncado");
+        assertArrayEquals(intencaoInicial, Files.readAllBytes(ficheiroIntencao(pasta)),
+                "a intenção tem de ser preservada");
+        assertEquals(0, contarEventos(pasta, "REPARACAO"));
+    }
+
+    @Test
+    void logCorrompidoNaoAlteraODiarioDeEventos(@TempDir Path pasta) throws Exception {
+        byte[] l1 = linha(1, "ana", "arquivo", "primeiro");
+        Files.write(ficheiro(pasta), unir(l1, utf8("lixo-terminado-por-newline\n")));
+
+        byte[] diario = unir(
+                utf8("2025-01-01T00:00:00Z;ARRANQUE;ok\n"),
+                utf8("2025-01-01T00:00:01Z;CORT"));
+        Files.write(ficheiroEventos(pasta), diario);
+
+        assertThrows(LogRegistos.CorrupcaoException.class, () -> LogRegistos.abrir(pasta, null));
+
+        assertArrayEquals(diario, Files.readAllBytes(ficheiroEventos(pasta)),
+                "o diário tem de ficar byte a byte como estava");
+        assertFalse(Files.exists(ficheiroIntencao(pasta)),
+                "uma corrupção não pode gerar nem deixar intenção");
+    }
 }

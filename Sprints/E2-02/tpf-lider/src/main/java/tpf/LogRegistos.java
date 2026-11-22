@@ -231,99 +231,83 @@ public final class LogRegistos implements AutoCloseable {
     /**
      * Abre (ou cria) `registos.log`, validando e reparando o ficheiro.
      *
-     * Ordem das operações (a ordem é a garantia):
-     *  0a. LÊ e VALIDA as linhas completas de `eventos-lider.txt` — sem alterar nada;
-     *  0b. só depois, corta a cauda parcial do diário (é escrita parcial, não corrupção);
-     *  1.  lê e conclui uma intenção de reparação pendente, validando o prefixo do log
-     *      e conferindo que o tamanho corresponde a `fimValido` (já truncado) ou a
-     *      `fimValido + descartados` (cauda ainda presente);
-     *  2.  varre `registos.log`; se houver cauda sem '\n', grava a intenção (force),
-     *      trunca, emite REPARACAO (no máximo uma vez) e apaga a intenção.
+     * O arranque tem DUAS FASES, e é isso que garante a política de preservação:
      *
-     * Nenhum ficheiro é modificado antes de as suas linhas completas serem validadas:
-     * perante corrupção, os ficheiros ficam byte-a-byte como estavam.
+     *  FASE 1 — VALIDAR (nenhum ficheiro é alterado, nem uma truncagem):
+     *    a) linhas COMPLETAS de `eventos-lider.txt` (a cauda parcial ainda não é tocada);
+     *    b) `reparacao.intent`, se existir (ilegível aborta e fica no disco);
+     *    c) compatibilidade da intenção com o log (P1–P7);
+     *    d) o log inteiro (`varrer`): cauda sem '\n' é escrita parcial, lixo terminado aborta.
      *
-     * @throws CorrupcaoException se houver uma linha terminada por '\n' que não seja
-     *         um registo válido, um LSN fora de sequência, uma intenção de reparação
-     *         ilegível ou incompatível com o log, ou uma linha de eventos inválida.
-     *         Em qualquer destes casos o chamador deve terminar o processo: o
-     *         arranque NÃO pode prosseguir.
+     *  FASE 2 — ALTERAR (só chega aqui o que passou a fase 1):
+     *    1. cortar a cauda parcial do diário de eventos (antes de lhe escrever o REPARACAO);
+     *    2. concluir a reparação pendente, ou criar e concluir uma nova.
+     *
+     * Assim, uma intenção incompatível ou um log corrompido abortam com os TRÊS ficheiros
+     * byte-a-byte intactos — incluindo a cauda parcial do diário, que é o primeiro alvo
+     * de escrita do arranque.
+     *
+     * @throws CorrupcaoException se o log, o diário ou a intenção não forem válidos, ou se
+     *         a intenção for incompatível com o log. Nesses casos o chamador deve terminar
+     *         o processo: o arranque NÃO pode prosseguir.
      */
     public static LogRegistos abrir(Path pasta, Eventos eventos) throws IOException, CorrupcaoException {
         Path ficheiro = pasta.resolve(FICHEIRO);
+        Path ficheiroEventos = pasta.resolve(FICHEIRO_EVENTOS);
         Files.createDirectories(pasta);
 
-        // 0a) VALIDAR o diário de eventos ANTES de lhe tocar. Uma linha completa
-        //     inválida é corrupção: abortamos com o ficheiro intacto.
-        Path ficheiroEventos = pasta.resolve(FICHEIRO_EVENTOS);
+        // ================= FASE 1 — VALIDAR (sem alterações) =================
+
+        // (a) diário de eventos: só as linhas completas são validadas aqui.
         byte[] dadosEventos = lerBytesOpcional(ficheiroEventos);
+        int eventosFimValido = fimValidoDe(dadosEventos);
+        validarLinhasEventos(dadosEventos, eventosFimValido);
+
+        // (b) intenção pendente de um arranque anterior.
+        IntencaoReparacao pendente = lerIntencao(pasta);
+
+        // (c) a intenção é compatível com o log? (P1–P7) — antes de qualquer escrita.
+        if (pendente != null) validarEstadoContraIntencao(ficheiro, pendente);
+
+        // (d) o log inteiro: aqui é que uma cauda sem '\n' é descoberta e o lixo terminado aborta.
+        byte[] dadosLog = lerBytesOpcional(ficheiro);
+        Varrimento v = (dadosLog == null) ? new Varrimento(0, 0, List.of()) : varrer(dadosLog);
+
+        long ultimo = v.ultimoLsn();
+        int fimValidoLog = v.fimValido();
+
+        // ================= FASE 2 — ALTERAR (só o que passou a fase 1) =================
+
+        // 1. O diário é reparado primeiro porque o REPARACAO vai ser acrescentado a ele:
+        //    escrever depois de uma linha cortada colaria as duas. Chegámos aqui com o
+        //    ficheiro validado, por isso esta truncagem é segura.
         long eventosDescartados = 0;
-
-        if (dadosEventos != null) {
-            int fimValidoEventos = fimValidoDe(dadosEventos);
-            validarLinhasEventos(dadosEventos, fimValidoEventos);
-
-            // 0b) Só agora, com o ficheiro validado, se corta a cauda parcial.
-            //     É seguro: o canal de `Eventos` usa O_APPEND, logo escreve sempre no
-            //     fim do ficheiro atual, mesmo que este tenha sido truncado entretanto.
-            if (fimValidoEventos < dadosEventos.length) {
-                eventosDescartados = dadosEventos.length - (long) fimValidoEventos;
-                truncar(ficheiroEventos, fimValidoEventos);
-            }
+        if (dadosEventos != null && eventosFimValido < dadosEventos.length) {
+            eventosDescartados = dadosEventos.length - (long) eventosFimValido;
+            truncar(ficheiroEventos, eventosFimValido);
         }
-
         if (eventosDescartados > 0) {
             System.err.println("AVISO: " + ficheiroEventos.getFileName() + ": "
                     + eventosDescartados + " bytes de uma escrita parcial descartados.");
         }
 
+        // 2. Reparação do log: primeiro a intenção pendente, senão uma cauda nova.
         long descartados = 0;
 
-        // 1) Intenção pendente de um arranque anterior: concluí-la primeiro.
-        //    É idempotente, não duplica o evento REPARACAO e — se o estado do log
-        //    não for compatível — aborta sem tocar em nada (ver concluirReparacao).
-        IntencaoReparacao pendente = lerIntencao(pasta);
         if (pendente != null) {
-            concluirReparacao(pasta, pendente);
-            // A reparação foi concluída/emitida NESTE arranque: os bytes descartados
-            // são os que a intenção descreve, não zero. Sem isto, o operador veria
-            // "sem reparações" logo a seguir a uma reparação ter corrido.
+            concluirReparacao(pasta, pendente);      // revalida (idempotente) e aplica
             descartados = pendente.descartados();
+        } else if (dadosLog != null && fimValidoLog < dadosLog.length) {
+            long novos = dadosLog.length - (long) fimValidoLog;
+
+            IntencaoReparacao intencao = new IntencaoReparacao(
+                    UUID.randomUUID().toString(), fimValidoLog, novos, ultimo,
+                    sha256Hex(dadosLog, fimValidoLog));
+            escreverIntencao(pasta, intencao);
+            concluirReparacao(pasta, intencao);
+            descartados += novos;
         }
 
-        long ultimo;
-
-        if (Files.exists(ficheiro)) {
-            // Lemos os BYTES e procuramos '\n' explicitamente.
-            // Nunca usar BufferedReader.readLine(): esconde se a última linha
-            // tinha ou não terminador, que é precisamente a informação que decide
-            // entre "escrita parcial" e "corrupção".
-            byte[] dados = Files.readAllBytes(ficheiro);
-            Varrimento v = varrer(dados);            // lança CorrupcaoException se houver lixo no meio
-            ultimo = v.ultimoLsn();
-            int fimValido = v.fimValido();
-
-            if (fimValido < dados.length) {
-                // Sobrou cauda sem '\n': escrita parcial interrompida por crash.
-                long novos = dados.length - (long) fimValido;
-
-                // 2) A INTENÇÃO tem de estar durável ANTES de se tocar no log,
-                //    e leva a impressão digital do prefixo que diz ser válido.
-                IntencaoReparacao intencao = new IntencaoReparacao(
-                        UUID.randomUUID().toString(), fimValido, novos, ultimo,
-                        sha256Hex(dados, fimValido));
-                escreverIntencao(pasta, intencao);
-                concluirReparacao(pasta, intencao);
-
-                // Soma (e não atribuição): pode haver uma intenção pendente concluída
-                // acima e, ainda assim, uma cauda nova descoberta pelo varrimento.
-                descartados += novos;
-            }
-        } else {
-            ultimo = 0;                              // ficheiro novo: o primeiro LSN será 1
-        }
-
-        // Só agora abrimos o canal de escrita, já com o ficheiro num estado íntegro.
         Canal canal = new CanalFicheiro(ficheiro);
         return new LogRegistos(pasta, canal, ultimo, descartados, eventos);
     }

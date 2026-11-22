@@ -41,7 +41,15 @@ Implementado:
 - `eventos-lider.txt` com os eventos `REGISTO`, `SELADO`, `REPARACAO` e os de arranque;
 - `/rajada <n> <intervalo_ms>` a injetar `n` registos sintéticos pelo mesmo caminho;
 - `/estado` passou a mostrar o último LSN, o número de chunks selados e a ocupação do chunk
-  aberto.
+  aberto;
+- **arranque em duas fases**: valida diário de eventos, intenção e log por inteiro antes de
+  alterar o que quer que seja; só depois corta caudas, grava a intenção e emite `REPARACAO`
+  (§5.2.4);
+- **`/registar` preserva o texto submetido** (sem `trim`); só valores que são *tokens* — o
+  `<id>` de `/replica-remover` — são aparados (§7);
+- **falha do log ≠ falha do chunk**: log falhado ⇒ o pedido não aconteceu (mensagem di-lo e
+  repetir é seguro); chunk falhado ⇒ registo durável, resposta com o LSN, falha apenas em
+  `ERRO` (§9).
 
 Ainda **não** implementado (fica para os sprints seguintes): catálogo, manifesto, réplicas,
 colocação e recuperação a partir das réplicas.
@@ -439,12 +447,14 @@ apagaria registos possivelmente confirmados.
 
 `eventos-lider.txt` é a evidência da reparação, por isso é tratado com as mesmas regras do log.
 
-**Princípio: validar antes de alterar.** O arranque nunca modifica um ficheiro antes de as suas
-linhas completas estarem validadas. A ordem é: ler os bytes → validar as linhas de
-`[0, fimValido)` → **só depois** cortar a cauda parcial. Se houver corrupção, o ficheiro fica
-byte-a-byte como estava, incluindo a cauda parcial que havia para cortar. A regra contrária
-(cortar primeiro, validar depois) deixaria marcas da nossa passagem num ficheiro que
-decidimos recusar — e o operador já não poderia inspecionar o estado original.
+**Princípio: validar antes de alterar — em todo o arranque.** O arranque tem duas fases
+separadas. Na **fase de validação** nada é escrito: validam-se as linhas completas de
+`eventos-lider.txt`, lê-se `reparacao.intent`, verifica-se a compatibilidade da intenção com o
+log (P1–P7) e varre-se `registos.log`. Só na **fase de escrita** se corta a cauda parcial do
+diário, se grava a intenção, se trunca o log e se emite `REPARACAO`. Consequência prática: uma
+intenção incompatível ou um log corrompido abortam com os **três** ficheiros byte-a-byte
+intactos — incluindo a cauda parcial do diário, que de outro modo seria o primeiro alvo de
+escrita do arranque.
 
 **Validação.** Cada linha terminada por `\n` tem de ser `instante;evento;detalhe` (3 campos,
 `split(";", 3)`), com instante ISO-8601 parseável e `evento` não vazio. Uma linha terminada
@@ -591,7 +601,10 @@ Notas de desenho:
   corrupção.
 - **O tamanho total em claro é sempre múltiplo de `PAD_BYTES`.** `/rajada 500 0` com
   `-Dtpf.chunkMax=4096` produz vários chunks, todos com `bytes` (no evento `SELADO`) múltiplo de
-  4096.
+  4096. Este cenário está fixado pelo teste
+        `rajadaProduzVariosChunksPorTamanhoTodosMultiplosDePad`, que injeta o limite pequeno na
+        instância em vez de depender da propriedade; `-Dtpf.chunkMax=4096` continua a ser a forma de
+        o observar à mão, com o líder a correr.
 - `texto` pode conter `;`, `\n` e tabs: é *length-prefixed*, não há escapes nem separadores.
 - Leitura direta (`Chunk.ler`) e inversa (`Chunk.lerInverso`) são implementadas em separado e
   produzem exatamente a mesma lista; a inversa é a usada em `Sealed.registos(...)`.
@@ -707,6 +720,11 @@ Notas:
   são *tokens* — como o `<id>` de `/replica-remover` — são aparados antes de validados. As
   mensagens de `#arquivo` (`getContentRaw()`) têm o mesmo tratamento, pelo que o mesmo texto
   produz o mesmo registo por qualquer das vias.
+- Um `/registar` (ou mensagem em `#arquivo`) só devolve **erro** quando falha a **fase do log**:
+  nesse caso nada ficou gravado e a mensagem di-lo explicitamente («o registo **não** foi
+  gravado … podes repetir sem duplicar»). Se falhar a **fase do chunk** (artefacto derivado), a
+  resposta é o LSN — o registo está durável — e a falha aparece apenas como evento `ERRO` em
+  `eventos-lider.txt`.
 
 ## 8. Como verificar os critérios de aceitação
 
@@ -896,6 +914,7 @@ Testes automáticos (não precisam de Discord nem de rede):
 mvn -q test
 # o stderr com "ERRO CRÍTICO ..." e "AVISO: eventos-lider.txt: N bytes ..." é esperado:
 # vem dos testes que simulam falhas de escrita e caudas parciais, não de falhas da suite.
+# a suite demora ~5 s a mais por causa do teste da selagem temporal.
 
 # para ver o resumo escondido pelo -q:
 grep -h "Tests run" target/surefire-reports/*.txt
@@ -932,7 +951,11 @@ grep -h "Tests run" target/surefire-reports/*.txt
     `REPARACAO`; `intent=abc` não deduplica contra `intent=abc-outro`; linha terminada inválida
     aborta; instante inválido aborta; diário com linha inválida **e** cauda parcial não é
     alterado (prova de "validar antes de alterar"); diário com linha de 2 campos e cauda
-    parcial também não é alterado;
+    parcial também não é alterado; `intencaoIncompativelNaoAlteraODiarioDeEventos` (cauda
+    parcial no log **e** no diário, com intenção de `descartados` errado — os três gatilhos ao
+    mesmo tempo) e `logCorrompidoNaoAlteraODiarioDeEventos` provam que, quando o arranque
+    aborta, o diário fica byte a byte igual: comparam `Files.readAllBytes` antes e depois da
+    chamada a `abrir`;
   - **intenção ilegível**: conteúdo inválido, campos em falta, linha sem `chave=valor` e
     `prefixoSha256` malformado abortam, sempre com o ficheiro intacto.
 - `ChunkTest` — o texto em claro é **múltiplo de `PAD_BYTES`** e não acrescenta mais de um bloco
@@ -951,12 +974,39 @@ grep -h "Tests run" target/surefire-reports/*.txt
   `.bin` **não contém o texto em claro** e o `.hdr` só tem `keyVersion;salt;nonce` (3 campos,
   32 e 12 bytes descodificados); `Sealed.ler` + `Sealed.registos` reconstroem exatamente os
   registos; **byte alterado no `.bin`** e **outra chave mestra** fazem `abrir` falhar.
+- `LeaderBotTest` — regras de texto, sem Discord: `/registar` preserva `"  olá  "` e
+  `"\n  y: 1\n"`; o `<id>` de `/replica-remover` é aparado (`"  abc  "` → `"abc"`); `"   "`,
+  `""` e `null` são rejeitados em ambos os modos, via `validarTexto(valor, nome, aparar)`.
+- `LeaderBotChunkTest` — integração do líder sem Discord, via `LeaderBot.paraTestes(...)`
+  (injeta `Eventos`, `LogRegistos`, a chave mestra, a pasta de dados e, quando é preciso, o
+  limite de chunk; não arranca JDA nem regista comandos). Tem quatro testes:
+  `falhaDoChunkNaoInvalidaUmRegistoJaDuravel` ocupa `selados/` com um **ficheiro** (falha
+  determinística ao gravar o chunk) e regista três registos de ~30 KB — os dois primeiros ficam
+  abaixo de `CHUNK_MAX_BYTES` e o terceiro obriga a selar — verificando que as três chamadas a
+  `registar` devolvem LSN 1, 2 e 3 **sem lançar**, que os três registos ficam no log e que o
+  diário ganha um `ERRO` com «chunk abandonado»; `falhaDoLogNaoAvancaOLsnNemOMandaParaOChunk`
+  fecha o `LogRegistos` (falha da fase do log) e confirma que `registar` lança `IOException`,
+  que `ultimoLsn()` não avança e que não há duplicados;
+  `umSoRegistoProduzUmChunkSeladoPelaSelagemTemporal` regista **um** único registo e espera até
+  `Wire.SELAGEM_MS + 5 s` (~5 s por omissão) pelo `.bin` em `selados/`, confirmando que o nome
+  é o SHA-256 do conteúdo, que o `SELADO` tem `lsn=1-1` e que o chunk reabre devolvendo
+  exatamente esse registo; e `rajadaProduzVariosChunksPorTamanhoTodosMultiplosDePad` injeta 200
+  registos pelo método que `/rajada` usa (`injetarRajada`, cujo texto sintético é `rajada i/n`,
+  ~50 bytes de corpo por registo) com o limite de chunk injetado a 4096 bytes — o mesmo valor
+  que `-Dtpf.chunkMax=4096` — e verifica que aparecem **vários** chunks, que cada nome é o
+  SHA-256 do conteúdo, que os eventos `SELADO` têm intervalos **contíguos** a cobrir 1..200 com
+  `bytes=` múltiplo de `PAD_BYTES`, e que reabrir cada chunk devolve exatamente os registos do
+  seu intervalo — comparando, chunk a chunk, os registos reconstruídos com os do log nesse
+  intervalo (LSN, autor, canal, texto e instante em milissegundos, que é a resolução do
+  formato binário) — 200 no total, com LSN 1..200 sem saltos.
 
 Os testes de fail-stop usam um canal injetado (`LogRegistos.paraTestes` com uma implementação
 de `LogRegistos.Canal` em memória), porque não há forma de provocar falhas de I/O
 determinísticas num `FileChannel` real. O canal de teste permite escolher **quais** as chamadas
 a `forcar()` falham, o que é o que distingue "rollback completo" de "truncagem ok, `force`
-falhado".
+falhado". Pela mesma razão, `LeaderBotChunkTest` usa `LeaderBot.paraTestes(...)`: injeta
+`Eventos`, `LogRegistos`, a chave mestra e a pasta de dados sem arrancar JDA nem registar
+comandos, e provoca a falha do chunk ocupando o nome `selados/` com um ficheiro comum.
 
 ## 9. Notas de desenho
 
@@ -971,12 +1021,27 @@ falhado".
 - **LSN recuperado do ficheiro.** A numeração vem de `último + 1` lido de `registos.log`, nunca
   de um contador em memória, e a atribuição é atómica dentro do método sincronizado.
 - **O chunk é derivado, o log é a fonte de verdade.** Se a cifra ou a escrita do chunk falhar,
-  o chunk aberto mantém-se (não é descartado) e os registos continuam duráveis no log; o log
-  permite reconstruir qualquer chunk. Um chunk **nunca** é a única cópia de um registo.
+  os registos continuam duráveis no log — um chunk **nunca** é a única cópia de um registo — e
+  o log permite reconstruir qualquer chunk. Numa falha de selagem o chunk aberto é
+  **abandonado** (deixa de aceitar registos) e o intervalo de LSN afetado fica registado como
+  `ERRO`: mantê-lo aberto propagaria a falha a todos os registos seguintes e deixaria um
+  temporizador armado para selar um chunk condenado.
+- **Falha do log ≠ falha do chunk.** O caminho de escrita tem duas fases com semânticas
+  opostas: o log é a fonte de verdade (falha ⇒ nada foi gravado, o utilizador é informado e
+  pode repetir sem duplicar) e o chunk é artefacto derivado (falha ⇒ o registo está durável, o
+  LSN é definitivo, a resposta é o sucesso e a falha só aparece como `ERRO` em
+  `eventos-lider.txt`). Só a `IOException` da fase 1 chega ao chamador — é isso que impede um
+  erro de chunk de provocar um registo duplicado por repetição do utilizador.
+- **O limite do chunk é injetável.** `Wire.CHUNK_MAX_BYTES` é `static final` e é lido uma
+  única vez por JVM, pelo que um valor vindo de `-Dtpf.chunkMax` não é fiável dentro de uma
+  suite que reutiliza o processo. O líder guarda o limite num campo de instância
+  (`limiteChunk`, por omissão `Wire.CHUNK_MAX_BYTES`) e a fábrica
+  `paraTestes(..., limiteChunk)` permite exercitar a selagem por tamanho com limites pequenos;
+  em produção o valor vem sempre de `Wire`.
 - **Selagem: o registo que provoca o limite fica no chunk.** O registo entra primeiro e só
-  depois se compara com `CHUNK_MAX_BYTES`, pelo que nenhum registo é deixado de fora nem
-  duplicado na fronteira. A selagem por tempo é armada no **primeiro** registo do chunk e o
-  callback confirma que o chunk ainda é o mesmo antes de selar.
+  depois se compara com o limite, pelo que nenhum registo é deixado de fora nem duplicado na
+  fronteira. A selagem por tempo é armada no **primeiro** registo do chunk e o callback confirma
+  que o chunk ainda é o mesmo antes de selar.
 - **O critério é o terminador, não a validade sintática.** Base64 inválido numa cauda sem `\n` é
   o resultado normal de um crash a meio do append e descarta-se; Base64 inválido numa linha
   terminada é corrupção e aborta (§5.1.1). Tratar os dois casos da mesma forma daria ou um
@@ -998,9 +1063,12 @@ falhado".
   tamanho diferente, ou com registos completos para lá de `fimValido` — o arranque aborta e os
   ficheiros ficam para inspeção. Truncar "para o tamanho que a intenção diz" seria adivinhar, e
   adivinhar mal significa perder registos confirmados.
-- **Validar antes de alterar.** Nenhum ficheiro é cortado — nem a cauda parcial do diário —
-  antes de as suas linhas completas estarem validadas. Perante corrupção, o estado em disco é
-  exatamente o que o operador deixou, para poder ser inspecionado.
+- **Validar antes de alterar, em todo o arranque.** O arranque tem duas fases: **validar**
+  (linhas completas do diário, intenção pendente, compatibilidade P1–P7 e varrimento do log) e
+  só depois **alterar** (cortar a cauda do diário, gravar a intenção, truncar o log, emitir
+  `REPARACAO`). Perante corrupção ou incompatibilidade, os **três** ficheiros ficam byte a byte
+  como o operador os deixou — incluindo a cauda parcial do diário, que de outro modo seria o
+  primeiro alvo de escrita do arranque.
 - **Evidência não se confunde com menção.** A deduplicação de `REPARACAO` compara campos exatos
   (`evento == REPARACAO` e `intent == <id>`), porque uma substring transforma qualquer
   referência numa prova e suprime a evidência que se queria garantir.

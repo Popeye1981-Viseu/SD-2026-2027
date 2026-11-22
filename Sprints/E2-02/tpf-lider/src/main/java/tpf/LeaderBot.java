@@ -30,15 +30,19 @@ import net.dv8tion.jda.api.utils.MarkdownSanitizer;
 /**
  * Líder do arquivo distribuído (TPF) — Sprint E2-02: escrita local durável.
  *
- * Fluxo de um registo (único para /registar, #arquivo e /rajada):
- *   1. LSN + linha em registos.log com fsync (fonte de verdade);
- *   2. entra no chunk aberto;
- *   3. o chunk é selado quando atinge Wire.CHUNK_MAX_BYTES ou Wire.SELAGEM_MS
- *      depois do primeiro registo; selar = padding + cifra + selados/<id>.bin|.hdr
- *      + evento SELADO.
+ * Fluxo de um registo (único para /registar, #arquivo e /rajada), com DUAS fases
+ * e semânticas de erro DIFERENTES:
  *
- * Só depois de (1) é que o utilizador recebe o LSN: o log é a fonte de verdade,
- * o chunk é derivado e re-sealável a partir dele num sprint futuro.
+ *   FASE 1 — log (fonte de verdade): LSN + linha em registos.log com fsync.
+ *            Se falhar, NADA foi gravado e o utilizador é informado; repetir é seguro.
+ *
+ *   FASE 2 — chunk (artefacto derivado): entra no chunk aberto, que pode selar.
+ *            Se falhar, o registo CONTINUA durável e o LSN é definitivo: a resposta
+ *            ao utilizador é o sucesso, e a falha só fica em eventos-lider.txt como
+ *            ERRO, com o chunk aberto abandonado (reconstruível a partir do log).
+ *
+ * Só a IOException da fase 1 chega ao chamador. É isso que impede o duplicado:
+ * o utilizador nunca é convidado a repetir um registo que já está no log.
  *
  * Texto: `isBlank()` VALIDA e `trim()` MUTA. Só se apara o que é token (ex.: o id
  * de /replica-remover); o texto de /registar é guardado exatamente como submetido.
@@ -63,6 +67,7 @@ public final class LeaderBot extends ListenerAdapter {
     private final LogRegistos log;
     private final byte[] chaveMestra;      // 32 bytes; usada para a DEK de cada chunk
     private final Path pastaDados;
+    private final long limiteChunk;        // bytes em claro que provocam a selagem
     private final ScheduledExecutorService agendador;
 
     // Chunk aberto e o temporizador de selagem. Ambos só são tocados dentro de
@@ -71,10 +76,17 @@ public final class LeaderBot extends ListenerAdapter {
     private ScheduledFuture<?> selagemAgendada;
 
     private LeaderBot(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados) {
+        this(eventos, log, chaveMestra, pastaDados, Wire.CHUNK_MAX_BYTES);
+    }
+
+    private LeaderBot(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados,
+                      long limiteChunk) {
+        if (limiteChunk <= 0) throw new IllegalArgumentException("limiteChunk tem de ser > 0");
         this.eventos = eventos;
         this.log = log;
         this.chaveMestra = chaveMestra.clone();
         this.pastaDados = pastaDados;
+        this.limiteChunk = limiteChunk;
         this.agendador = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "tpf-agendador");
             t.setDaemon(true);
@@ -82,6 +94,24 @@ public final class LeaderBot extends ListenerAdapter {
         });
     }
 
+    /**
+     * Instância com dependências injetadas, para testes que não precisam de Discord:
+     * não arranca JDA nem regista comandos. Reservado a testes (mesmo padrão de
+     * {@link LogRegistos#paraTestes}).
+     */
+    static LeaderBot paraTestes(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados) {
+        return new LeaderBot(eventos, log, chaveMestra, pastaDados);
+    }
+
+    /**
+     * Como acima, mas com o limite de chunk injectado. Existe porque
+     * `Wire.CHUNK_MAX_BYTES` é `static final` e é lido uma única vez por JVM: sem este
+     * parâmetro, um teste não consegue provocar vários chunks sem dormir por megabytes.
+     */
+    static LeaderBot paraTestes(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados,
+                                long limiteChunk) {
+        return new LeaderBot(eventos, log, chaveMestra, pastaDados, limiteChunk);
+    }
     // ------------------------------------------------------------------
     // Arranque
     // ------------------------------------------------------------------
@@ -197,22 +227,25 @@ public final class LeaderBot extends ListenerAdapter {
     }
 
     // ------------------------------------------------------------------
-    // Caminho ÚNICO de escrita
+    // Caminho ÚNICO de escrita — duas fases
     // ------------------------------------------------------------------
 
     /**
-     * Registo + entrada no chunk aberto, sob o mesmo lock: a ordem dos LSN no log
-     * e no chunk é a mesma, e nenhuma selagem concorre com um append.
+     * FASE 1 (log) + FASE 2 (chunk), sob o mesmo lock.
+     *
+     * Contrato de erro, e é isto que evita duplicados:
+     *  - `IOException` propagada  -> NADA foi gravado; o utilizador pode repetir;
+     *  - retorno normal           -> o registo está durável no log e o LSN é definitivo,
+     *                                mesmo que a fase 2 tenha falhado por dentro.
      */
-    private synchronized long registar(String autor, String canal, String texto) throws IOException {
-        // 1. Fonte de verdade: LSN + linha durável. O Registo devolvido já tem os
-        //    valores sanitizados que ficaram escritos, para o chunk não divergir do log.
+    synchronized Registo registar(String autor, String canal, String texto) throws IOException {
+        // Fase 1: fonte de verdade. Se isto falhar, nada foi escrito e o erro sobe.
         Registo registo = log.acrescentarRegisto(autor, canal, texto);
 
-        // 2. Entra no chunk aberto (pode selar por tamanho).
-        adicionarAoChunk(registo);
+        // Fase 2: artefacto derivado. Nunca propaga — o registo já está confirmado.
+        entrarNoChunk(registo);
 
-        return registo.lsn();
+        return registo;
     }
 
     /** Acrescenta ao chunk aberto e sela se o limite tiver sido atingido. */
@@ -226,8 +259,36 @@ public final class LeaderBot extends ListenerAdapter {
 
         // "O registo que faz o chunk exceder o limite sela-o de imediato": o registo
         // entra primeiro e só depois se sela — nunca se perde o que provocou o limite.
-        if (chunkAberto.bytes() >= Wire.CHUNK_MAX_BYTES) {
+        if (chunkAberto.bytes() >= limiteChunk) {
             selarChunkAberto();
+        }
+    }
+
+    /**
+     * Fase 2 isolada: uma falha do chunk NÃO invalida um registo já durável.
+     *
+     * O chunk aberto é abandonado (fica em memória, os registos ficam no log) para
+     * que a falha não se propague a todos os registos seguintes, e o intervalo de LSN
+     * afetado fica registado como ERRO — a evidência de que existe trabalho derivado
+     * em falta. Reconstruir chunks a partir do log é o sprint seguinte.
+     */
+    private void entrarNoChunk(Registo registo) {
+        try {
+            adicionarAoChunk(registo);
+        } catch (IOException | RuntimeException e) {
+            Chunk abandonado = chunkAberto;
+            chunkAberto = null;
+            cancelarSelagemAgendada();
+
+            String intervalo = (abandonado == null)
+                    ? "?"
+                    : abandonado.lsnMinimo() + "-" + abandonado.lsnMaximo();
+
+            registarEvento("ERRO", "chunk abandonado (lsn " + intervalo + "): registo lsn="
+                    + registo.lsn() + " está durável em registos.log mas não entrou no chunk ("
+                    + e.getMessage() + "); o chunk é reconstruível a partir do log");
+            System.err.println("AVISO: registo lsn=" + registo.lsn()
+                    + " está durável; a falha foi apenas no chunk derivado.");
         }
     }
 
@@ -247,8 +308,11 @@ public final class LeaderBot extends ListenerAdapter {
         try {
             selarChunkAberto();
         } catch (IOException e) {
+            // A selagem por tempo é derivada: falha aqui não afeta nenhum registo durável.
             registarEvento("ERRO", "selagem por tempo falhou (lsn " + alvo.lsnMinimo()
                     + "-" + alvo.lsnMaximo() + "): " + e.getMessage());
+            chunkAberto = null;
+            cancelarSelagemAgendada();
         }
     }
 
@@ -274,9 +338,8 @@ public final class LeaderBot extends ListenerAdapter {
         try {
             cifrado = ChunkCrypto.cifrar(chaveMestra, claro);
         } catch (ChunkCrypto.CifraException e) {
-            registarEvento("ERRO", "falha ao cifrar o chunk lsn=" + c.lsnMinimo() + "-"
-                    + c.lsnMaximo() + ": " + e.getMessage());
-            throw new IOException("falha ao cifrar o chunk: " + e.getMessage(), e);
+            throw new IOException("falha ao cifrar o chunk lsn=" + c.lsnMinimo() + "-"
+                    + c.lsnMaximo() + ": " + e.getMessage(), e);
         }
 
         Sealed selado = Sealed.gravar(pastaDados, cifrado);
@@ -326,12 +389,14 @@ public final class LeaderBot extends ListenerAdapter {
             registarEvento("INVALIDO", "/" + nome + ": " + e.getMessage());
             recusar(ev, e.getMessage());
         } catch (IOException e) {
-            registarEvento("ERRO", "/" + nome + ": falha de I/O no log/chunk: " + e.getMessage());
+            // Só chega aqui uma falha da FASE 1 (log): o registo NÃO existe.
+            registarEvento("ERRO", "/" + nome + ": o registo NÃO foi gravado: " + e.getMessage());
             recusar(ev, log.estaBloqueado()
-                    ? "O arquivo está temporariamente indisponível: o log entrou em fail-stop"
-                    + " depois de uma falha de escrita. É preciso reiniciar o líder"
-                    + " para reparar a cauda de registos.log."
-                    : "Não foi possível gravar o registo. Tente novamente.");
+                    ? "❌ O registo **não** foi gravado: o log entrou em fail-stop depois de uma"
+                    + " falha de escrita. É preciso reiniciar o líder para reparar a cauda de"
+                    + " `registos.log`."
+                    : "❌ O registo **não** foi gravado (falha de I/O no log). Nada ficou"
+                    + " registado, por isso podes repetir sem duplicar.");
         }
     }
 
@@ -341,8 +406,11 @@ public final class LeaderBot extends ListenerAdapter {
         // início/fim podem ser significativos (código, YAML, indentação). `isBlank()`
         // rejeita o vazio sem mutar o valor.
         String texto = textoOriginal(ev, "texto");
-        long lsn = registar(ev.getUser().getName(), CANAL_ARQUIVO, texto);
-        responder(ev, "Registado com LSN **" + lsn + "**.");
+
+        // Se o registo voltar daqui, está durável — mesmo que o chunk tenha falhado
+        // por dentro (a falha é derivada e fica registada como ERRO em eventos-lider.txt).
+        Registo registo = registar(ev.getUser().getName(), CANAL_ARQUIVO, texto);
+        responder(ev, "Registado com LSN **" + registo.lsn() + "**.");
     }
 
     // /estado
@@ -399,17 +467,10 @@ public final class LeaderBot extends ListenerAdapter {
 
     /** n registos sintéticos pelo MESMO caminho de /registar (LSN + fsync + chunk). */
     private void executarRajada(SlashCommandInteractionEvent ev, String autor, long n, long intervalo) {
-        long primeiro = -1;
-        long ultimo = -1;
         try {
-            for (long i = 1; i <= n; i++) {
-                if (i > 1 && intervalo > 0) Thread.sleep(intervalo);
-                long lsn = registar(autor, CANAL_ARQUIVO, "rajada " + i + "/" + n);
-                if (primeiro < 0) primeiro = lsn;
-                ultimo = lsn;
-            }
-            ev.getHook().sendMessage("Rajada concluída: " + n + " registos, LSN " + primeiro
-                    + " a " + ultimo + ".").setAllowedMentions(List.of()).queue();
+            long[] extremos = injetarRajada(autor, n, intervalo);
+            ev.getHook().sendMessage("Rajada concluída: " + n + " registos, LSN " + extremos[0]
+                    + " a " + extremos[1] + ".").setAllowedMentions(List.of()).queue();
 
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -417,11 +478,29 @@ public final class LeaderBot extends ListenerAdapter {
             ev.getHook().sendMessage("❌ Rajada interrompida.").setAllowedMentions(List.of()).queue();
 
         } catch (IOException e) {
-            registarEvento("ERRO", "/rajada: falha ao gravar: " + e.getMessage());
-            long feitos = ultimo < 0 ? 0 : ultimo - primeiro + 1;
-            ev.getHook().sendMessage("❌ Rajada interrompida depois de " + feitos + " registos.")
-                    .setAllowedMentions(List.of()).queue();
+            registarEvento("ERRO", "/rajada: o registo NÃO foi gravado: " + e.getMessage());
+            ev.getHook().sendMessage("❌ Rajada interrompida: o próximo registo falhou no log"
+                    + " e podes repetir.").setAllowedMentions(List.of()).queue();
         }
+    }
+
+    /**
+     * Injeta `n` registos pelo MESMO caminho de `/registar` (LSN + fsync + chunk) e
+     * devolve `{primeiroLsn, ultimoLsn}`.
+     *
+     * Separado do envio da resposta para poder ser exercitado por testes: a resposta
+     * exige um evento do Discord, a injecção não.
+     */
+    long[] injetarRajada(String autor, long n, long intervalo) throws IOException, InterruptedException {
+        long primeiro = -1;
+        long ultimo = -1;
+        for (long i = 1; i <= n; i++) {
+            if (i > 1 && intervalo > 0) Thread.sleep(intervalo);
+            long lsn = registar(autor, CANAL_ARQUIVO, "rajada " + i + "/" + n).lsn();
+            if (primeiro < 0) primeiro = lsn;
+            ultimo = lsn;
+        }
+        return new long[]{primeiro, ultimo};
     }
 
     // ------------------------------------------------------------------
@@ -440,19 +519,19 @@ public final class LeaderBot extends ListenerAdapter {
         String texto = ev.getMessage().getContentRaw();
 
         try {
-            long lsn = registar(autor, CANAL_ARQUIVO, texto);
+            Registo registo = registar(autor, CANAL_ARQUIVO, texto);
             ev.getMessage()
-                    .reply("Registado com LSN **" + lsn + "**.")
+                    .reply("Registado com LSN **" + registo.lsn() + "**.")
                     .mentionRepliedUser(false)
                     .setAllowedMentions(List.of())
                     .queue();
         } catch (IOException e) {
-            registarEvento("ERRO", "#arquivo: falha ao gravar a mensagem de " + autor + ": " + e.getMessage());
+            registarEvento("ERRO", "#arquivo: o registo NÃO foi gravado: " + e.getMessage());
             ev.getMessage()
                     .reply(log.estaBloqueado()
                             ? "❌ Não foi possível registar: o log entrou em fail-stop."
                             + " O líder tem de ser reiniciado para reparar a cauda."
-                            : "❌ Não foi possível registar a mensagem. Tente novamente.")
+                            : "❌ A mensagem **não** foi registada. Podes repetir sem duplicar.")
                     .mentionRepliedUser(false)
                     .setAllowedMentions(List.of())
                     .queue();
@@ -556,7 +635,7 @@ public final class LeaderBot extends ListenerAdapter {
     }
 
     /** Fecho limpo: sela o chunk pendente, fecha canais e o agendador. */
-    private synchronized void fechar() {
+    synchronized void fechar() {
         try {
             selarChunkAberto();               // não perder o chunk aberto num shutdown limpo
         } catch (IOException e) {
