@@ -664,4 +664,23 @@ public final class LeaderBot extends ListenerAdapter {
             // a terminar
         }
     }
+
+    /**
+     * Devolve a mensagem de recusa se existirem dados do arquivo sem master.key, ou null se
+     * o arranque pode prosseguir. Chamado ANTES de Wire.carregarOuCriarMasterKey.
+     */
+    static String recusaPorFaltaDeChave(Path caminhoChave, Path pastaDados, boolean aceitarNovaChave) {
+        if (aceitarNovaChave || Files.exists(caminhoChave)) return null;
+
+        boolean temLog     = Files.exists(pastaDados.resolve(LogRegistos.FICHEIRO));
+        boolean temEventos = Files.exists(pastaDados.resolve(LogRegistos.FICHEIRO_EVENTOS));
+        boolean temSelados = Files.isDirectory(pastaDados.resolve(Sealed.PASTA));
+        if (!temLog && !temEventos && !temSelados) return null;
+
+        return "existem dados do arquivo em " + pastaDados.toAbsolutePath()
+                + " mas falta a chave mestra " + caminhoChave.toAbsolutePath() + "."
+                + " Criar uma chave nova tornaria os chunks existentes indecifráveis."
+                + " Reponha a master.key a partir de uma cópia de segurança ou arranque com"
+                + " -Dtpf.novaChave=true se aceita começar de novo.";
+    }
 }
