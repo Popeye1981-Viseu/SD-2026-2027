@@ -125,10 +125,21 @@ public final class LeaderBot extends ListenerAdapter {
         }
 
         // 1. Raiz de confiança (fail-fast, antes de qualquer socket)
+        Path pastaDados   = Path.of(System.getProperty("tpf.pasta", "dados-lider"));   // ← movida de 139
         Path caminhoChave = Path.of(System.getProperty("tpf.masterKey", "master.key"));
+
+        // 1a. NUNCA criar uma chave nova por cima de um arquivo que já existe.
+        String recusa = recusaPorFaltaDeChave(caminhoChave, pastaDados,
+                Boolean.getBoolean("tpf.novaChave"));
+        if (recusa != null) {
+            System.err.println("ERRO FATAL NO ARRANQUE: " + recusa);
+            System.exit(1);
+            return;
+        }
+
         byte[] masterKey;
         try {
-            masterKey = Wire.carregarOuCriarMasterKey(caminhoChave);
+            masterKey = Wire.carregarOuCriarMasterKey(caminhoChave);   // só agora pode criar
         } catch (Wire.MasterKeyException e) {
             System.err.println("ERRO FATAL NO ARRANQUE: " + e.getMessage());
             System.exit(1);
@@ -136,7 +147,6 @@ public final class LeaderBot extends ListenerAdapter {
         }
 
         // 2. Recuperação do log (fail-fast: cauda parcial reparada, corrupção aborta)
-        Path pastaDados = Path.of(System.getProperty("tpf.pasta", "dados-lider"));
         Eventos eventos;
         LogRegistos log;
         try {
