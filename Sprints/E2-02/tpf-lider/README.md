@@ -97,6 +97,15 @@ indicado por `-Dtpf.masterKey`), com 32 bytes aleatórios e permissões `rw-----
 **Não a apague:** sem ela não é possível decifrar os chunks. Se existir mas não tiver 32 bytes,
 o líder recusa arrancar e **não** altera o ficheiro — a decisão é do administrador.
 
+**A `master.key` nunca é regenerada por cima de dados existentes.** Se `registos.log`,
+`eventos-lider.txt` ou `selados/` já existirem e a `master.key` faltar — apagada, caminho de
+`-Dtpf.masterKey` errado, mudança de máquina — o líder **recusa arrancar** com um diagnóstico
+que explica o risco: uma chave nova cifraria os chunks seguintes com outra chave e tornaria os
+anteriores indecifráveis, deixando o arquivo a parecer íntegro e a não o ser. As saídas são
+repor a chave a partir de uma cópia de segurança ou assumir a rotura com
+`-Dtpf.novaChave=true`. A verificação é feita **antes** de chamar o `Wire`, portanto a chave só
+chega a ser criada quando não há nada a perder.
+
 ## 3. Arrancar o líder
 
 ```bash
@@ -136,6 +145,7 @@ autocomplete.
 | `tpf.chunkMax` | `65536` | `CHUNK_MAX_BYTES`: limite em claro que provoca a selagem do chunk |
 | `tpf.pad` | `4096` | `PAD_BYTES`: o texto do chunk é completado até um múltiplo deste valor |
 | `tpf.selagem` | `5000` | `SELAGEM_MS`: tempo máximo (ms) que um chunk fica aberto |
+| `tpf.novaChave` | `false` | aceita criar uma `master.key` nova mesmo existindo dados (perde a capacidade de decifrar os chunks antigos) |
 
 Exemplo com tudo explícito:
 
@@ -908,6 +918,16 @@ printf 'X' | dd of=dados-lider/registos.log bs=1 seek=30 conv=notrunc
 #  - o ficheiro NÃO é alterado e NÃO é criada nenhuma intenção
 ```
 
+Simular **dados sem `master.key`** (deve abortar sem criar uma chave nova):
+
+```bash
+mv master.key /tmp/master.key.bak
+./correr-bot.sh
+#   -> "ERRO FATAL NO ARRANQUE: existem dados do arquivo em … mas falta a chave mestra …"
+ls master.key 2>/dev/null && echo "ERRO: criou uma chave nova!" || echo "ok: nao criou chave"
+mv /tmp/master.key.bak master.key     # repor a chave verdadeira
+```
+
 Testes automáticos (não precisam de Discord nem de rede):
 
 ```bash
@@ -1090,3 +1110,9 @@ comandos, e provoca a falha do chunk ocupando o nome `selados/` com um ficheiro 
   `Eventos`, `LogRegistos`, a chave mestra, a pasta de dados, o chunk aberto e o agendador; o
   `bloqueado` do log é um campo de instância. Isso torna o fecho limpo (shutdown hook) e os
   testes possíveis.
+- **Nunca se gera uma chave nova por cima de dados existentes.** `Wire.carregarOuCriarMasterKey`
+  cria a chave quando ela falta, o que é o comportamento correto no primeiro arranque e o
+  comportamento errado quando já há `registos.log`, `eventos-lider.txt` ou `selados/`: a chave
+  nova torna os chunks anteriores indecifráveis e o líder ficaria a arrancar sobre um arquivo
+  que não sabe ler. O arranque valida essa combinação antes de tocar no `Wire` e recusa,
+  exigindo `-Dtpf.novaChave=true` para uma rotura consciente.
