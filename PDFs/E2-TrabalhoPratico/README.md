@@ -12,7 +12,8 @@ Os documentos são organizados por tema, sprint ou componente da unidade curricu
 
 | Documento | Descrição |
 |---|---|
-| `E2-01.pdf` | Resumo técnico do Sprint E2-01, Trabalho prático- Configurações iniciais em discord e criação dos comandos. |
+| `E2-01.pdf` | Resumo técnico do Sprint E2-01, Trabalho Prático - Configurações iniciais em discord e criação dos comandos. |
+| `E2-02.pdf` | Resumo técnico do Sprint E2-02, Trabalho Prático - Sprint E2-02 — Escrita local durável do líder. |
 
 ## Critérios de organização
 
