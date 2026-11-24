@@ -360,7 +360,7 @@ public final class LeaderBot extends ListenerAdapter {
     @Override
     public void onSlashCommandInteraction(SlashCommandInteractionEvent ev) {
         if (!CANAL_ARQUIVO.equals(ev.getChannel().getName())) {
-            //recusar(ev, "Este comando só pode ser usado no canal #" + CANAL_ARQUIVO + ".");
+            recusar(ev, "Este comando só pode ser usado no canal #" + CANAL_ARQUIVO + ".");
             return;
         }
 
