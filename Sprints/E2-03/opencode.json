@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@razroo/opencode-model-fallback"],
+  "model": "deepseek/deepseek-v4.1-flash-1017",
+  "agent": {
+    "verifier": {
+      "model": "opencode/deepseek-v4.1-flash-free#max",
+      "fallback_models": [
+        "deepseek/deepseek-v4.1-flash-1017#max"
+      ]
+    }
+  },
+  "permissions": [
+    { "action": "shell", "resource": "*", "effect": "ask" },
+    { "action": "shell", "resource": "git *", "effect": "allow" },
+    { "action": "shell", "resource": "mvn *", "effect": "allow" },
+    { "action": "shell", "resource": "grep *", "effect": "allow" },
+    { "action": "shell", "resource": "find *", "effect": "allow" },
+    { "action": "edit", "resource": "*", "effect": "allow" }
+  ]
+}
