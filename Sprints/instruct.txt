@@ -1,0 +1,9 @@
+Lê os enunciados em docs/ (Epico2.md, E2-01.md, E2-02.md, E2-03.md) e o README.md.
+
+Passo 1: invoca @implementer com a tarefa de implementar o sprint 3 (E2-03.md).
+Passo 2: quando o implementer terminar, invoca @verifier e passa-lhe:
+  - a lista de critérios de aceitação extraída do E2-03.md;
+  - o resumo de alterações e o diff produzido pelo implementer.
+
+O verifier deve devolver um relatório critério a critério com PASS/FAIL e evidência.
+Se houver FAILs, mostra-me o relatório e pergunta antes de mandares o implementer corrigir.
