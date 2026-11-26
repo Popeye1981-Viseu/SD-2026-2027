@@ -1,9 +1,20 @@
-Lê os enunciados em docs/ (Epico2.md, E2-01.md, E2-02.md, E2-03.md) e o README.md.
+Lê os enunciados em `Sprints/E2-03/docs/` (Epico2.md, E2-01.md, E2-02.md, E2-03.md) e o estado atual do líder em `Sprints/E2-03/tpf-lider/README.md`.
 
-Passo 1: invoca @implementer com a tarefa de implementar o sprint 3 (E2-03.md).
-Passo 2: quando o implementer terminar, invoca @verifier e passa-lhe:
-  - a lista de critérios de aceitação extraída do E2-03.md;
-  - o resumo de alterações e o diff produzido pelo implementer.
+Vais atuar como o orquestrador do sistema. Tens a ferramenta `subagent` disponível. Não tentes escrever o código tu mesmo.
 
-O verifier deve devolver um relatório critério a critério com PASS/FAIL e evidência.
-Se houver FAILs, mostra-me o relatório e pergunta antes de mandares o implementer corrigir.
+Passo 1: 
+Usa a ferramenta `subagent` para invocar o agente `implementer`. Passa-lhe as seguintes instruções:
+- Lê os enunciados em `Sprints/E2-03/docs/` e o `Sprints/E2-03/tpf-lider/README.md`.
+- Implementa o sprint 3 (E2-03.md).
+- Cria o novo projeto em `Sprints/E2-03/tpf-replica/`.
+- Atualiza o `Sprints/E2-03/tpf-lider/` conforme necessário e mantém o `Sprints/E2-03/tpf-lider/README.md` atualizado.
+- Cria um `Sprints/E2-03/tpf-replica/README.md` a documentar a réplica.
+
+Passo 2: 
+Quando o `implementer` terminar, usa a ferramenta `subagent` para invocar o agente `verifier`. Passa-lhe:
+- A lista de critérios de aceitação extraída do `Sprints/E2-03/docs/E2-03.md`.
+- O resumo das alterações e o diff produzido pelo implementer.
+Pede-lhe para validar critério a critério (PASS/FAIL) com evidências.
+
+Passo 3 (Condicional):
+Se o relatório do `verifier` contiver algum FAIL, mostra-me o relatório detalhado e PÁRA IMEDIATAMENTE. Não peças ao implementer para corrigir sem a minha autorização explícita.

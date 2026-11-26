@@ -1,7 +1,7 @@
 ---
 description: Implementa o código do sprint com base nos enunciados e no estado atual do projeto. Usa o modelo pago Flash 4.1 para máxima qualidade.
 mode: subagent
-model: deepseek/deepseek-v4.1-flash-1017#max
+model: deepseek/deepseek-flash#max
 temperature: 0.2
 ---
 

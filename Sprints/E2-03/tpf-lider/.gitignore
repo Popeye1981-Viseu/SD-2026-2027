@@ -5,6 +5,7 @@ discord.token
 # master key do arquivo (gerada com head -c 32 /dev/urandom > master.key)
 master.key
 *.key
+*.key.bak
 
 # ---- dados de execução do líder (gerados nos ensaios) ----
 registos.log
@@ -24,3 +25,6 @@ out/
 .vscode/
 .DS_Store
 
+
+# gerado pelo maven-shade-plugin
+dependency-reduced-pom.xml

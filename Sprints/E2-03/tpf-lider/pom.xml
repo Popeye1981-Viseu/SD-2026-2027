@@ -40,7 +40,12 @@
             <version>5.10.2</version>
             <scope>test</scope>
         </dependency>
-        <!-- Nos próximos sprints entra aqui o Java-WebSocket (org.java-websocket) para o PubSubHub -->
+        <!-- servidor do hub de publish/subscribe (E2-03) -->
+        <dependency>
+            <groupId>org.java-websocket</groupId>
+            <artifactId>Java-WebSocket</artifactId>
+            <version>1.5.7</version>
+        </dependency>
     </dependencies>
 
     <build>

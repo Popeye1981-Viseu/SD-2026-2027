@@ -113,12 +113,21 @@ class LeaderBotChunkTest {
             assertNotNull(bin, "nenhum chunk selado apareceu em "
                     + (Wire.SELAGEM_MS + 5_000) + " ms (SELAGEM_MS=" + Wire.SELAGEM_MS + ")");
 
+            // O `.bin` fica visível antes do evento SELADO (o evento é escrito a
+            // seguir, com fsync). Esperar pelo evento evita uma corrida no teste.
+            String diario = "";
+            long fimEvento = System.currentTimeMillis() + 2_000;
+            while (System.currentTimeMillis() < fimEvento) {
+                diario = Files.readString(pasta.resolve(LogRegistos.FICHEIRO_EVENTOS),
+                        StandardCharsets.UTF_8);
+                if (diario.contains(";SELADO;")) break;
+                Thread.sleep(20);
+            }
+
             // O nome é o SHA-256 do conteúdo e o evento SELADO cobre exatamente o LSN 1.
             String chunkId = bin.getFileName().toString().replace(Sealed.EXT_BIN, "");
             assertEquals(ChunkCrypto.sha256Hex(Files.readAllBytes(bin)), chunkId);
 
-            String diario = Files.readString(pasta.resolve(LogRegistos.FICHEIRO_EVENTOS),
-                    StandardCharsets.UTF_8);
             assertTrue(diario.contains(";SELADO;"), diario);
             assertTrue(diario.contains("chunkId=" + chunkId), diario);
             assertTrue(diario.contains("lsn=1-1"), diario);
