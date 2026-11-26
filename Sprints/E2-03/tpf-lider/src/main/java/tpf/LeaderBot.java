@@ -3,14 +3,20 @@ package tpf;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
-import java.util.stream.Stream;
 
 import net.dv8tion.jda.api.JDA;
 import net.dv8tion.jda.api.JDABuilder;
@@ -28,10 +34,22 @@ import net.dv8tion.jda.api.requests.GatewayIntent;
 import net.dv8tion.jda.api.utils.MarkdownSanitizer;
 
 /**
- * Líder do arquivo distribuído (TPF) — Sprint E2-02: escrita local durável.
+ * Líder do arquivo distribuído (TPF).
  *
- * Fluxo de um registo (único para /registar, #arquivo e /rajada), com DUAS fases
- * e semânticas de erro DIFERENTES:
+ * E2-02: caminho de escrita local durável (LSN, log com fsync, chunk selado
+ * e cifrado).
+ *
+ * E2-03: depois de selar e gravar o chunk em `selados/`, o líder insere-o no
+ * catálogo como SELADO, escolhe R réplicas por rendezvous hashing ponderado
+ * pelo espaço livre (com reserva atómica), publica STORE nos tópicos
+ * privados e espera pelos ACK. Um ACK só conta se o hash for o chunkId, o id
+ * da mensagem for o id AUTENTICADO da ligação e essa réplica tiver recebido o
+ * STORE desse chunk. O chunk passa a DURAVEL quando os ACK válidos atingem
+ * max(W_MIN, ⌊R/2⌋+1). Ao fim de ACK_TIMEOUT_MS há nova ronda, excluindo as
+ * réplicas já tentadas, até R cópias ou MAX_RONDAS.
+ *
+ * Fluxo de um registo (único para /registar, #arquivo e /rajada), com DUAS
+ * fases e semânticas de erro DIFERENTES:
  *
  *   FASE 1 — log (fonte de verdade): LSN + linha em registos.log com fsync.
  *            Se falhar, NADA foi gravado e o utilizador é informado; repetir é seguro.
@@ -59,6 +77,12 @@ public final class LeaderBot extends ListenerAdapter {
     static final int MAX_ECO = 200;
     static final int MAX_RAJADA = 5000;
 
+    /** Publicação de uma mensagem num tópico (o hub real ou um fake de teste). */
+    @FunctionalInterface
+    interface Publicador {
+        void publicar(String topico, String mensagem);
+    }
+
     // ------------------------------------------------------------------
     // Estado do líder
     // ------------------------------------------------------------------
@@ -69,26 +93,50 @@ public final class LeaderBot extends ListenerAdapter {
     private final Path pastaDados;
     private final long limiteChunk;        // bytes em claro que provocam a selagem
     private final ScheduledExecutorService agendador;
+    // /rajada pode durar minutos; não pode bloquear selagem, ACK nem o monitor.
+    private final ExecutorService rajadaExecutor;
+
+    private final Catalog catalogo;
+    private final ReplicaRegistry replicas;
+    private final Publicador publicador;   // null => usa o hub, se estiver ligado
+    private final long ackTimeoutMs;
+    private final int maxRondas;
+    private final int fatorR;
+
+    private volatile PubSubHub hub;
 
     // Chunk aberto e o temporizador de selagem. Ambos só são tocados dentro de
     // métodos synchronized nesta instância (o agendador entra pelo mesmo lock).
     private Chunk chunkAberto;
     private ScheduledFuture<?> selagemAgendada;
 
-    private LeaderBot(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados) {
-        this(eventos, log, chaveMestra, pastaDados, Wire.CHUNK_MAX_BYTES);
-    }
+    // Estado das colocações em curso, por chunkId. Protegido pelo lock da instância.
+    private final Map<String, Colocacao> colocacoes = new HashMap<>();
 
     private LeaderBot(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados,
-                      long limiteChunk) {
+                      long limiteChunk, Catalog catalogo, ReplicaRegistry replicas,
+                      Publicador publicador, long ackTimeoutMs, int maxRondas, int fatorR) {
         if (limiteChunk <= 0) throw new IllegalArgumentException("limiteChunk tem de ser > 0");
+        if (catalogo == null) throw new IllegalArgumentException("catálogo nulo");
+        if (replicas == null) throw new IllegalArgumentException("registo de réplicas nulo");
         this.eventos = eventos;
         this.log = log;
         this.chaveMestra = chaveMestra.clone();
         this.pastaDados = pastaDados;
         this.limiteChunk = limiteChunk;
+        this.catalogo = catalogo;
+        this.replicas = replicas;
+        this.publicador = publicador;
+        this.ackTimeoutMs = ackTimeoutMs;
+        this.maxRondas = maxRondas;
+        this.fatorR = fatorR;
         this.agendador = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "tpf-agendador");
+            t.setDaemon(true);
+            return t;
+        });
+        this.rajadaExecutor = Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "tpf-rajada");
             t.setDaemon(true);
             return t;
         });
@@ -100,7 +148,7 @@ public final class LeaderBot extends ListenerAdapter {
      * {@link LogRegistos#paraTestes}).
      */
     static LeaderBot paraTestes(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados) {
-        return new LeaderBot(eventos, log, chaveMestra, pastaDados);
+        return paraTestes(eventos, log, chaveMestra, pastaDados, Wire.CHUNK_MAX_BYTES);
     }
 
     /**
@@ -110,8 +158,33 @@ public final class LeaderBot extends ListenerAdapter {
      */
     static LeaderBot paraTestes(Eventos eventos, LogRegistos log, byte[] chaveMestra, Path pastaDados,
                                 long limiteChunk) {
-        return new LeaderBot(eventos, log, chaveMestra, pastaDados, limiteChunk);
+        return new LeaderBot(eventos, log, chaveMestra, pastaDados, limiteChunk,
+                Catalog.vazio(pastaDados), new ReplicaRegistry(eventos), null,
+                Wire.ACK_TIMEOUT_MS, Wire.MAX_RONDAS, Wire.R);
     }
+
+    /** Instância de teste com catálogo, registo de réplicas e publicador injetados. */
+    static LeaderBot paraTestesComReplicas(Eventos eventos, LogRegistos log, byte[] chaveMestra,
+                                           Path pastaDados, long limiteChunk, Catalog catalogo,
+                                           ReplicaRegistry replicas, Publicador publicador,
+                                           long ackTimeoutMs, int maxRondas, int fatorR) {
+        return new LeaderBot(eventos, log, chaveMestra, pastaDados, limiteChunk, catalogo,
+                replicas, publicador, ackTimeoutMs, maxRondas, fatorR);
+    }
+
+    /** Instância de produção: catálogo carregado e registo de réplicas vazio. */
+    static LeaderBot paraProducao(Eventos eventos, LogRegistos log, byte[] chaveMestra,
+                                  Path pastaDados, Catalog catalogo) {
+        return new LeaderBot(eventos, log, chaveMestra, pastaDados, Wire.CHUNK_MAX_BYTES,
+                catalogo, new ReplicaRegistry(eventos), null,
+                Wire.ACK_TIMEOUT_MS, Wire.MAX_RONDAS, Wire.R);
+    }
+
+    /** Liga o hub ao líder. A partir daqui, STORE/ACK passam a usar a rede. */
+    void ligarHub(PubSubHub hub) {
+        this.hub = hub;
+    }
+
     // ------------------------------------------------------------------
     // Arranque
     // ------------------------------------------------------------------
@@ -125,7 +198,7 @@ public final class LeaderBot extends ListenerAdapter {
         }
 
         // 1. Raiz de confiança (fail-fast, antes de qualquer socket)
-        Path pastaDados   = Path.of(System.getProperty("tpf.pasta", "dados-lider"));   // ← movida de 139
+        Path pastaDados   = Path.of(System.getProperty("tpf.pasta", "dados-lider"));
         Path caminhoChave = Path.of(System.getProperty("tpf.masterKey", "master.key"));
 
         // 1a. NUNCA criar uma chave nova por cima de um arquivo que já existe.
@@ -163,7 +236,17 @@ public final class LeaderBot extends ListenerAdapter {
             return;
         }
 
-        LeaderBot lider = new LeaderBot(eventos, log, masterKey, pastaDados);
+        // 3. Catálogo (fail-fast: um catálogo ilegível não pode ser adivinhado)
+        Catalog catalogo;
+        try {
+            catalogo = Catalog.carregar(pastaDados);
+        } catch (IOException e) {
+            System.err.println("ERRO FATAL NO ARRANQUE: catalogo.txt inválido: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+
+        LeaderBot lider = LeaderBot.paraProducao(eventos, log, masterKey, pastaDados, catalogo);
         Runtime.getRuntime().addShutdownHook(new Thread(lider::fechar, "tpf-shutdown"));
 
         lider.registarEvento("ARRANQUE", "master.key validada (" + masterKey.length + " bytes)");
@@ -171,8 +254,31 @@ public final class LeaderBot extends ListenerAdapter {
                 + (log.bytesDescartadosNaRecuperacao() > 0
                 ? ", " + log.bytesDescartadosNaRecuperacao() + " bytes de escrita parcial descartados"
                 : ", sem reparações"));
+        lider.registarEvento("ARRANQUE", "catálogo: " + catalogo.total() + " chunks ("
+                + catalogo.contar(Catalog.Estado.DURAVEL) + " DURAVEL, "
+                + catalogo.subreplicados() + " subreplicados)");
 
-        // 3. Discord (só com chave e log válidos)
+        // 4. Hub de publish/subscribe (antes do Discord, para as réplicas poderem ligar-se)
+        try {
+            PubSubHub hub = new PubSubHub(Wire.PORTO, eventos, lider.replicas(), pastaDados,
+                    lider::receberDoHub);
+            lider.ligarHub(hub);
+            hub.start();
+            if (!hub.aguardarArranque(5_000)) {
+                System.err.println("ERRO FATAL NO ARRANQUE: o hub não conseguiu abrir o porto "
+                        + Wire.PORTO + " (ver eventos-lider.txt).");
+                System.exit(1);
+                return;
+            }
+        } catch (IOException | RuntimeException e) {
+            System.err.println("ERRO FATAL NO ARRANQUE: hub WebSocket no porto " + Wire.PORTO
+                    + ": " + e.getMessage());
+            System.exit(1);
+            return;
+        }
+        lider.iniciarMonitorDeReplicas();
+
+        // 5. Discord (só com chave, log, catálogo e hub válidos)
         JDA jda = JDABuilder.createDefault(token)
                 .enableIntents(GatewayIntent.GUILD_MESSAGES, GatewayIntent.MESSAGE_CONTENT)
                 .addEventListeners(lider)
@@ -334,9 +440,10 @@ public final class LeaderBot extends ListenerAdapter {
     }
 
     /**
-     * Sela o chunk aberto: padding, cifra, escrita em `selados/` e evento SELADO.
-     * O chunk só é descartado DEPOIS de estar gravado: uma falha aqui deixa-o
-     * aberto (os registos continuam duráveis em registos.log).
+     * Sela o chunk aberto: padding, cifra, escrita em `selados/`, evento SELADO
+     * e entrada no catálogo/colocação. O chunk só é descartado DEPOIS de estar
+     * gravado: uma falha aqui deixa-o aberto (os registos continuam duráveis em
+     * registos.log).
      */
     private void selarChunkAberto() throws IOException {
         Chunk c = chunkAberto;
@@ -361,6 +468,260 @@ public final class LeaderBot extends ListenerAdapter {
                 + " lsn=" + c.lsnMinimo() + "-" + c.lsnMaximo()
                 + " bytes=" + claro.length                      // texto em claro, múltiplo de PAD_BYTES
                 + " cifrados=" + selado.tamanhoCifrado());      // .bin = claro + 16 (tag GCM)
+
+        try {
+            catalogo.adicionar(selado, c.lsnMinimo(), c.lsnMaximo());
+        } catch (IOException e) {
+            registarEvento("ERRO", "chunk " + selado.chunkId()
+                    + " selado mas NÃO entrou no catálogo: " + e.getMessage());
+            return;
+        }
+
+        try {
+            colocarChunk(selado);
+        } catch (IOException e) {
+            registarEvento("ERRO", "colocação do chunk " + selado.chunkId()
+                    + " falhou: " + e.getMessage());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Colocação replicada (E2-03)
+    // ------------------------------------------------------------------
+
+    /** Estado de uma colocação em curso (uma por chunk). */
+    private static final class Colocacao {
+        final String chunkId;
+        final long tamanho;
+        final Set<String> tentadas = new HashSet<>();        // já receberam (ou tentaram) STORE
+        final Set<String> storeEnviado = new HashSet<>();    // validação de ACK
+        final Set<String> reservasPendentes = new HashSet<>(); // reservadas sem ACK
+        int ronda;
+        String binB64;
+        String hdrB64;
+
+        Colocacao(String chunkId, long tamanho) {
+            this.chunkId = chunkId;
+            this.tamanho = tamanho;
+        }
+    }
+
+    /** Entra no catálogo e arranca a primeira ronda de colocação. */
+    private synchronized void colocarChunk(Sealed selado) throws IOException {
+        Colocacao c = new Colocacao(selado.chunkId(), selado.tamanhoCifrado());
+        colocacoes.put(c.chunkId, c);
+        colocarRonda(c);
+    }
+
+    /**
+     * Executa uma ronda: exclui as réplicas já tentadas, reserva espaço para as
+     * que faltam e publica STORE. Agenda ACK_TIMEOUT_MS para a ronda.
+     */
+    private void colocarRonda(Colocacao c) {
+        c.ronda++;
+        registarEvento("RONDA", c.chunkId + " " + c.ronda);
+
+        Set<String> copias = catalogo.copias(c.chunkId);
+        if (copias.size() >= fatorR) {
+            concluir(c);
+            return;
+        }
+
+        int faltam = fatorR - copias.size();
+        Set<String> excluir = new HashSet<>(c.tentadas);
+        List<String> escolhidas = replicas.reserveAndChoose(c.chunkId, c.tamanho,
+                faltam, excluir);
+
+        int previstas = copias.size() + escolhidas.size();
+        if (escolhidas.size() < faltam) {
+            // Formato: SUBREPLICADO <chunkId> <n>/<R>
+            registarEvento("SUBREPLICADO", c.chunkId + " " + previstas + "/" + fatorR);
+        }
+        if (escolhidas.isEmpty()) {
+            concluir(c);
+            return;
+        }
+
+        try {
+            carregarBytes(c);
+        } catch (IOException e) {
+            registarEvento("ERRO", "não foi possível ler o chunk " + c.chunkId
+                    + " de " + Sealed.PASTA + ": " + e.getMessage());
+            for (String id : escolhidas) replicas.libertar(id, c.tamanho);
+            concluir(c);
+            return;
+        }
+
+        String mensagem = new Wire.Store(c.chunkId, c.hdrB64, c.binB64).encode();
+        for (String id : escolhidas) {
+            c.reservasPendentes.add(id);
+            c.tentadas.add(id);
+            c.storeEnviado.add(id);
+            registarEvento("STORE", c.chunkId + " -> " + id);
+            try {
+                publicar(Wire.topicReplica(id), mensagem);
+            } catch (RuntimeException e) {
+                registarEvento("ERRO", "STORE " + c.chunkId + " -> " + id + ": " + e.getMessage());
+            }
+        }
+
+        if (c.reservasPendentes.isEmpty()) {
+            concluir(c);
+            return;
+        }
+
+        final String chunkId = c.chunkId;
+        final int ronda = c.ronda;
+        agendador.schedule(() -> expirar(chunkId, ronda), ackTimeoutMs, TimeUnit.MILLISECONDS);
+    }
+
+    /** Fim de prazo de uma ronda: liberta reservas e tenta repor as cópias que faltam. */
+    private synchronized void expirar(String chunkId, int ronda) {
+        Colocacao c = colocacoes.get(chunkId);
+        if (c == null || c.ronda != ronda) return;            // ronda já ultrapassada
+
+        for (String id : new ArrayList<>(c.reservasPendentes)) {
+            replicas.libertar(id, c.tamanho);
+        }
+        c.reservasPendentes.clear();
+
+        int copias = catalogo.copias(chunkId).size();
+        if (copias >= fatorR) {
+            concluir(c);
+            return;
+        }
+        if (c.ronda >= maxRondas) {
+            registarEvento("SUBREPLICADO", chunkId + " " + copias + "/" + fatorR);
+            concluir(c);
+            return;
+        }
+
+        try {
+            colocarRonda(c);
+        } catch (RuntimeException e) {
+            registarEvento("ERRO", "ronda " + (c.ronda + 1) + " do chunk " + chunkId
+                    + " falhou: " + e.getMessage());
+            concluir(c);
+        }
+    }
+
+    /** Liberta os bytes em Base64 quando a colocação termina (o catálogo guarda o resto). */
+    private void concluir(Colocacao c) {
+        c.binB64 = null;
+        c.hdrB64 = null;
+    }
+
+    private void carregarBytes(Colocacao c) throws IOException {
+        Path pasta = pastaDados.resolve(Sealed.PASTA);
+        byte[] bin = Files.readAllBytes(pasta.resolve(c.chunkId + Sealed.EXT_BIN));
+        byte[] hdr = Files.readAllBytes(pasta.resolve(c.chunkId + Sealed.EXT_HDR));
+        c.binB64 = Base64.getEncoder().encodeToString(bin);
+        c.hdrB64 = Base64.getEncoder().encodeToString(hdr);
+    }
+
+    private void publicar(String topico, String mensagem) {
+        Publicador p = publicador;
+        if (p != null) {
+            p.publicar(topico, mensagem);
+            return;
+        }
+        PubSubHub h = hub;
+        if (h != null) h.publish(topico, mensagem);
+    }
+
+    /**
+     * Callback do hub: entrega uma mensagem publicada por uma réplica em
+     * tpf-lider, já com o id AUTENTICADO da ligação (não o id escrito na
+     * mensagem). Só HB, ACK e INVENTARIO são esperados neste sprint.
+     */
+    void receberDoHub(String idAutenticado, String mensagem) {
+        if (idAutenticado == null) return;
+
+        // Uma mensagem em voo de uma ligação já revogada por /replica-remover
+        // não pode ressuscitar a réplica no registo.
+        PubSubHub h = hub;
+        if (h != null && !h.registada(idAutenticado)) {
+            registarEvento("ERRO", "mensagem de réplica não registada (" + idAutenticado
+                    + ") ignorada: " + abreviar(mensagem));
+            return;
+        }
+
+        try {
+            switch (Wire.tipo(mensagem)) {
+                case "HB" -> {
+                    Wire.Hb hb = Wire.Hb.decode(mensagem);
+                    if (!hb.id().equals(idAutenticado)) {
+                        registarEvento("ERRO", "HB de " + idAutenticado
+                                + " com id de outra réplica (" + hb.id() + ")");
+                        return;
+                    }
+                    replicas.onHeartbeat(hb);
+                }
+                case "ACK" -> receberAck(idAutenticado, Wire.Ack.decode(mensagem));
+                case "INVENTARIO" -> {
+                    // Anti-entropia e reconciliação: sprint seguinte.
+                }
+                default -> registarEvento("ERRO", "mensagem inesperada de " + idAutenticado
+                        + " em " + Wire.TOPICO_LIDER + ": " + abreviar(mensagem));
+            }
+        } catch (Wire.FormatoInvalido e) {
+            registarEvento("ERRO", "mensagem inválida de " + idAutenticado
+                    + " em " + Wire.TOPICO_LIDER + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Valida e aplica um ACK. As três condições do enunciado, por esta ordem:
+     * (1) hash == chunkId; (2) id da mensagem == id autenticado da ligação;
+     * (3) a réplica recebeu o STORE deste chunk. Um ACK rejeitado não altera
+     * o catálogo nem as reservas.
+     */
+    private synchronized void receberAck(String idLigacao, Wire.Ack ack) {
+        String motivo;
+        Colocacao c = colocacoes.get(ack.chunkId());
+
+        if (!ack.chunkId().equals(ack.sha256())) {
+            motivo = "hash " + abreviar(ack.sha256()) + " diferente do chunkId";
+        } else if (!ack.id().equals(idLigacao)) {
+            motivo = "id da mensagem (" + abreviar(ack.id())
+                    + ") diferente do id autenticado da ligação (" + idLigacao + ")";
+        } else if (c == null) {
+            motivo = "chunk desconhecido (não houve STORE nesta execução)";
+        } else if (!c.storeEnviado.contains(idLigacao)) {
+            motivo = "a réplica não recebeu o STORE deste chunk";
+        } else if (catalogo.copias(ack.chunkId()).contains(idLigacao)) {
+            motivo = "cópia já confirmada";
+        } else {
+            motivo = null;
+        }
+
+        if (motivo != null) {
+            registarEvento("ACK-REJEITADO", ack.chunkId() + " " + idLigacao + " " + motivo);
+            return;
+        }
+
+        boolean eraDuravel = catalogo.estado(ack.chunkId()) == Catalog.Estado.DURAVEL;
+        try {
+            catalogo.confirmar(ack.chunkId(), idLigacao);
+        } catch (IOException e) {
+            registarEvento("ERRO", "falha ao gravar o catálogo depois do ACK de "
+                    + idLigacao + " para " + ack.chunkId() + ": " + e.getMessage());
+        }
+
+        // A reserva passa a usados: o espaço livre não fica sobrestimado até ao
+        // próximo heartbeat. Depois do ACK, a réplica deixa de estar pendente.
+        replicas.confirmarReserva(idLigacao, c.tamanho);
+        c.reservasPendentes.remove(idLigacao);
+
+        registarEvento("ACK", ack.chunkId() + " " + idLigacao);
+
+        if (!eraDuravel && catalogo.estado(ack.chunkId()) == Catalog.Estado.DURAVEL) {
+            registarEvento("DURAVEL", ack.chunkId());
+        }
+
+        if (catalogo.copias(ack.chunkId()).size() >= fatorR) {
+            concluir(c);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -425,11 +786,34 @@ public final class LeaderBot extends ListenerAdapter {
 
     // /estado
     private void cmdEstado(SlashCommandInteractionEvent ev) {
-        responder(ev, "`/estado` — último LSN: " + log.ultimoLsn()
-                + " · chunks selados: " + contarSelados()
-                + " · " + estadoDoChunkAberto()
-                + (log.estaBloqueado() ? " · log em fail-stop (reinicie o líder)" : "")
-                + " — réplicas ainda não implementadas");
+        StringBuilder sb = new StringBuilder();
+        sb.append("`/estado` — último LSN: ").append(log.ultimoLsn()).append('\n');
+
+        List<ReplicaRegistry.ReplicaInfo> infos = replicas.listar();
+        sb.append("**Réplicas** (").append(infos.size()).append(")\n");
+        if (infos.isEmpty()) {
+            sb.append("· nenhuma réplica registada\n");
+        } else {
+            int limite = Math.min(infos.size(), 15);
+            for (int i = 0; i < limite; i++) {
+                ReplicaRegistry.ReplicaInfo r = infos.get(i);
+                sb.append("· **").append(r.id()).append("** — ").append(r.estado())
+                        .append(" · ").append(formatarBytes(r.usados())).append('/')
+                        .append(formatarBytes(r.quota())).append(" · ")
+                        .append(catalogo.chunksPorReplica(r.id())).append(" chunks\n");
+            }
+            if (infos.size() > limite) {
+                sb.append("· … e ").append(infos.size() - limite).append(" outras\n");
+            }
+        }
+
+        sb.append("**Catálogo**: ").append(catalogo.total()).append(" chunks · SELADO ")
+                .append(catalogo.contar(Catalog.Estado.SELADO)).append(" · DURAVEL ")
+                .append(catalogo.contar(Catalog.Estado.DURAVEL)).append(" · subreplicados ")
+                .append(catalogo.subreplicados()).append('\n');
+        sb.append(estadoDoChunkAberto());
+        if (log.estaBloqueado()) sb.append(" · log em fail-stop (reinicie o líder)");
+        responder(ev, limitar(sb.toString()));
     }
 
     // /config r <n>
@@ -451,7 +835,18 @@ public final class LeaderBot extends ListenerAdapter {
 
     // /replica-token
     private void cmdReplicaToken(SlashCommandInteractionEvent ev) {
-        responder(ev, "`/replica-token` recebido — ainda não implementado");
+        PubSubHub h = hub;
+        if (h == null) {
+            recusar(ev, "O hub WebSocket não está ativo; o token não pode ser gerado.");
+            return;
+        }
+        String token = h.gerarToken();
+        // A resposta é EFÉMERA: só quem executou o comando vê o token. O token
+        // nunca é escrito em eventos-lider.txt.
+        responderEfemero(ev, "Token de registo (uso único, válido "
+                + (Wire.TOKEN_VALIDADE_MS / 60000) + " min):\n```\n" + token
+                + "\n```\nEntregue-o apenas a quem vai arrancar a réplica, no argumento opcional de "
+                + "`ReplicaService <id> <url> <quotaBytes> <token>`.");
     }
 
     // /replica-remover <id>
@@ -461,7 +856,27 @@ public final class LeaderBot extends ListenerAdapter {
         if (!ID_REPLICA.matcher(id).matches())
             throw new ArgumentoInvalido("Identificador de réplica inválido: \"" + eco(id)
                     + "\" (use só letras, dígitos, `_` e `-`, até 32 caracteres).");
-        responder(ev, "`/replica-remover` recebido: id=" + id + " — ainda não implementado");
+
+        PubSubHub h = hub;
+        if (h == null) {
+            recusar(ev, "O hub WebSocket não está ativo; não há chaves para revogar.");
+            return;
+        }
+        try {
+            boolean existia = h.removerReplica(id);
+            replicas.remover(id);
+            if (existia) {
+                registarEvento("REMOVIDA", id);
+                responder(ev, "Réplica **" + id + "** removida: chave revogada, ligação fechada e"
+                        + " excluída da colocação. As cópias que tinha ficam no catálogo até à"
+                        + " reconciliação do próximo sprint.");
+            } else {
+                recusar(ev, "Não existe réplica registada com o id \"" + eco(id) + "\".");
+            }
+        } catch (IOException e) {
+            registarEvento("ERRO", "/replica-remover " + id + ": " + e.getMessage());
+            recusar(ev, "❌ Não foi possível gravar `replicas.txt`: " + e.getMessage());
+        }
     }
 
     // /rajada <n> <intervaloMs>
@@ -471,7 +886,7 @@ public final class LeaderBot extends ListenerAdapter {
         String autor = ev.getUser().getName();
 
         ev.deferReply().queue(
-                ok -> agendador.execute(() -> executarRajada(ev, autor, n, intervalo)),
+                ok -> rajadaExecutor.execute(() -> executarRajada(ev, autor, n, intervalo)),
                 erro -> registarEvento("ERRO", "falha ao adiar a resposta de /rajada: " + erro.getMessage()));
     }
 
@@ -608,6 +1023,10 @@ public final class LeaderBot extends ListenerAdapter {
         ev.reply(texto).setAllowedMentions(List.of()).queue();
     }
 
+    static void responderEfemero(SlashCommandInteractionEvent ev, String texto) {
+        ev.reply(texto).setEphemeral(true).setAllowedMentions(List.of()).queue();
+    }
+
     static void recusar(SlashCommandInteractionEvent ev, String texto) {
         if (ev.isAcknowledged()) {
             ev.getHook().sendMessage("❌ " + texto).setEphemeral(true).setAllowedMentions(List.of()).queue();
@@ -621,22 +1040,40 @@ public final class LeaderBot extends ListenerAdapter {
         return MarkdownSanitizer.escape(t);
     }
 
+    private static String abreviar(String valor) {
+        if (valor == null) return "?";
+        return valor.length() <= MAX_ECO ? valor : valor.substring(0, MAX_ECO) + "…";
+    }
+
     /** Descrição do chunk aberto, lida sob o lock (não bloqueia escritas por muito tempo). */
     private synchronized String estadoDoChunkAberto() {
         if (chunkAberto == null) return "chunk aberto: nenhum";
         return "chunk aberto: " + chunkAberto.tamanho() + " registos, "
-                + chunkAberto.bytes() + "/" + Wire.CHUNK_MAX_BYTES + " bytes";
+                + chunkAberto.bytes() + "/" + limiteChunk + " bytes";
     }
 
-    /** Quantos `.bin` existem em `selados/` (-1 se a pasta não puder ser lida). */
-    private long contarSelados() {
-        Path pasta = pastaDados.resolve(Sealed.PASTA);
-        if (!Files.isDirectory(pasta)) return 0;
-        try (Stream<Path> ficheiros = Files.list(pasta)) {
-            return ficheiros.filter(p -> p.getFileName().toString().endsWith(Sealed.EXT_BIN)).count();
-        } catch (IOException e) {
-            return -1;
-        }
+    private static String formatarBytes(long bytes) {
+        if (bytes < 0) return "-";
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024L * 1024L) return String.format(Locale.ROOT, "%.1f KB", bytes / 1024.0);
+        return String.format(Locale.ROOT, "%.1f MB", bytes / (1024.0 * 1024.0));
+    }
+
+    private static String limitar(String texto) {
+        final int max = 1900;            // margem para o limite de 2000 do Discord
+        return texto.length() <= max ? texto : texto.substring(0, max) + "…";
+    }
+
+    /** Agenda a atualização periódica dos estados (VIVA/SUSPEITA/MORTA). */
+    void iniciarMonitorDeReplicas() {
+        long periodo = Math.max(200, Wire.PERIODO_HB_MS / 2);
+        agendador.scheduleAtFixedRate(() -> {
+            try {
+                replicas.atualizarEstados(System.currentTimeMillis());
+            } catch (RuntimeException e) {
+                registarEvento("ERRO", "monitor de réplicas: " + e.getMessage());
+            }
+        }, periodo, periodo, TimeUnit.MILLISECONDS);
     }
 
     private void registarEvento(String evento, String detalhe) {
@@ -644,13 +1081,28 @@ public final class LeaderBot extends ListenerAdapter {
         System.out.println(evento + " " + detalhe);
     }
 
-    /** Fecho limpo: sela o chunk pendente, fecha canais e o agendador. */
+    /** Fecho limpo: sela o chunk pendente, fecha hub, canais e o agendador. */
     synchronized void fechar() {
+        // Primeiro impede novas rajadas: /rajada pode estar a dormir entre registos.
+        rajadaExecutor.shutdownNow();
+
         try {
             selarChunkAberto();               // não perder o chunk aberto num shutdown limpo
         } catch (IOException e) {
             registarEvento("ERRO", "falha ao selar o chunk pendente no shutdown: " + e.getMessage());
         }
+
+        PubSubHub h = hub;
+        if (h != null) {
+            try {
+                h.parar();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } catch (RuntimeException e) {
+                registarEvento("ERRO", "falha ao parar o hub: " + e.getMessage());
+            }
+        }
+
         agendador.shutdownNow();
 
         try {
@@ -665,6 +1117,16 @@ public final class LeaderBot extends ListenerAdapter {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Acesso para testes e para o arranque
+    // ------------------------------------------------------------------
+
+    Catalog catalogo() { return catalogo; }
+
+    ReplicaRegistry replicas() { return replicas; }
+
+    int quorum() { return catalogo == null ? Wire.quorumDurabilidade() : Wire.quorumDurabilidade(fatorR, catalogo.wMin()); }
+
     /**
      * Devolve a mensagem de recusa se existirem dados do arquivo sem master.key, ou null se
      * o arranque pode prosseguir. Chamado ANTES de Wire.carregarOuCriarMasterKey.
@@ -675,7 +1137,9 @@ public final class LeaderBot extends ListenerAdapter {
         boolean temLog     = Files.exists(pastaDados.resolve(LogRegistos.FICHEIRO));
         boolean temEventos = Files.exists(pastaDados.resolve(LogRegistos.FICHEIRO_EVENTOS));
         boolean temSelados = Files.isDirectory(pastaDados.resolve(Sealed.PASTA));
-        if (!temLog && !temEventos && !temSelados) return null;
+        boolean temCatalogo = Files.exists(pastaDados.resolve(Catalog.FICHEIRO));
+        boolean temReplicas = Files.exists(pastaDados.resolve(PubSubHub.FICHEIRO_REPLICAS));
+        if (!temLog && !temEventos && !temSelados && !temCatalogo && !temReplicas) return null;
 
         return "existem dados do arquivo em " + pastaDados.toAbsolutePath()
                 + " mas falta a chave mestra " + caminhoChave.toAbsolutePath() + "."

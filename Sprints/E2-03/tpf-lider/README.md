@@ -1,9 +1,17 @@
-# tpf-lider · Sprint E2-02 (escrita local durável)
+# tpf-lider · Sprint E2-03 (hub, réplicas, colocação e catálogo)
 
-Bot Discord (JDA) que implementa o **caminho de escrita local do líder**: cada `/registar`,
-cada mensagem em `#arquivo` e cada registo de `/rajada` recebe um LSN, é gravado em
-`registos.log` com `fsync` **antes** de o utilizador receber a resposta, e entra no chunk
-aberto — que é selado, cifrado e escrito em `selados/`.
+Bot Discord (JDA) que implementa o **líder do arquivo distribuído**: cada `/registar`,
+cada mensagem em `#arquivo` e cada registo de `/rajada` recebe um LSN e é gravado em
+`registos.log` com `fsync` **antes** de o utilizador receber a resposta; o chunk aberto é
+selado, cifrado e escrito em `selados/`, colocado em **R = 3** réplicas por *rendezvous
+hashing* ponderado pelo espaço livre e passa a `DURAVEL` quando os `ACK` válidos cumprem
+`max(W_MIN, ⌊R/2⌋+1)`.
+
+O líder é também o **hub de publish/subscribe sobre WebSocket**: as réplicas registam-se
+com um token de uso único, autenticam-se por desafio-resposta Ed25519, subscrevem o seu
+tópico privado e `tpf-ctl`, publicam heartbeats e `ACK` em `tpf-lider`, e o líder publica
+`STORE` em `tpf-r-<id>`.
+
 
 ## Estado do sprint
 
@@ -51,10 +59,47 @@ Implementado:
   repetir é seguro); chunk falhado ⇒ registo durável, resposta com o LSN, falha apenas em
   `ERRO` (§9).
 
-Ainda **não** implementado (fica para os sprints seguintes): catálogo, manifesto, réplicas,
-colocação e recuperação a partir das réplicas.
-`/config`, `/recuperar`, `/replica-token` e `/replica-remover` mantêm a resposta provisória do
-sprint anterior.
+E2-03 (este sprint):
+
+- `Wire` com `PORTO` (8765), `PERIODO_HB_MS` (2000), `SUSPEITA_MS` (6000), `MORTA_MS` (10000),
+  `TOKEN_VALIDADE_MS` (600000), `R` (3), `W_MIN` (2), `ACK_TIMEOUT_MS` (4000), `MAX_RONDAS` (3),
+  `MARGEM_BYTES` (65536), `ALFA` (1.0), `BACKOFF_MIN_MS`/`BACKOFF_MAX_MS` (1000/30000), os
+  tópicos `tpf-lider`, `tpf-ctl` e `tpf-r-<id>`, e `encode()`/`decode()` para **OLA, DESAFIO,
+  PROVA, SUB, PUB, HB, ACK e STORE**. O quórum de durabilidade é calculado
+  (`max(W_MIN, ⌊R/2⌋+1)`), nunca uma constante;
+- **`PubSubHub`** (Java-WebSocket, porto `tpf.porto`): máquina `NOVA → DESAFIADA →
+  AUTENTICADA`, desafio de 32 bytes de `SecureRandom` novo por ligação e descartado após uma
+  tentativa, registo com token de uso único válido 10 min (consumido e gravado em
+  `replicas.txt` só depois de uma `PROVA` Ed25519 válida), recusa de `id` já registado com
+  outra chave, subscrições só em `tpf-r-<o seu id>` e `tpf-ctl`, publicações só em
+  `tpf-lider`, e entrega ao líder em processo **com o id autenticado da ligação**;
+- **`HeartbeatMonitor`**, **`ReplicaRegistry`** e **`Estado`**: `VIVA`/`SUSPEITA`/`MORTA`,
+  quota, `usados`, `reservados`, último HB, `reserveAndChoose` **atómico** (escolha + reserva
+  na mesma secção), `confirmarReserva`/`libertar`, eventos `ESTADO <id> <antigo> -> <novo>`;
+- **`Placement`**: rendezvous hashing ponderado, `u` dos primeiros 53 bits de
+  `SHA-256(chunkId + "|" + replicaId)`, pontuação `livre^ALFA / -ln(u)`, filtro
+  `livre >= tamanho + MARGEM_BYTES`, determinística;
+- **`Catalog`** (`catalogo.txt`): `chunkId;lsnDe;lsnAte;tamanho;replicas;estado`, estados
+  `SELADO`/`DURAVEL`, `adicionar`, `confirmar`, `copias`, `gravarAtomico` (temporário +
+  `ATOMIC_MOVE`), carregado no arranque;
+- **escrita replicada** no `LeaderBot`: entrada no catálogo como `SELADO`,
+  `reserveAndChoose(..., R, {})`, `STORE` em `tpf-r-<id>`, validação de `ACK` (hash, id
+  autenticado e STORE prévio), `DURAVEL` quando o quórum é atingido, `ACK_TIMEOUT_MS` liberta
+  reservas e dispara nova ronda com as restantes réplicas até `MAX_RONDAS`, continuando mesmo
+  depois de `DURAVEL`; eventos `STORE`, `ACK`, `ACK-REJEITADO`, `DURAVEL`, `SUBREPLICADO`,
+  `RONDA`;
+- **comandos Discord**: `/replica-token` gera um token real numa resposta **efémera** (só
+  `admin-arquivo`), `/replica-remover` revoga a chave, desliga a réplica e exclui-a da
+  colocação, e `/estado` mostra por réplica estado/ocupação/nº de chunks e no total os chunks
+  `SELADO`, `DURAVEL` e subreplicados;
+- **projeto `tpf-replica`** (novo): par Ed25519 persistido, cliente `java.net.http.WebSocket`,
+  `OLA`/`PROVA`/`SUB`, `HB` e `INVENTARIO`, `STORE` com verificação de quota e hash, escrita
+  atómica e `ACK` só depois, backoff exponencial 1 s → 30 s, eventos em `eventos-<id>.txt`.
+
+Ainda **não** implementado (fica para o sprint seguinte): manifesto cifrado, reconciliação
+(reparação e remoção de excesso), `DELETE`, desafios de posse (`POSSE?`/`desafios.txt`),
+`FETCH`, recuperação a partir das réplicas e `ArquivoCheck`. `/config` e `/recuperar` mantêm a
+resposta provisória do sprint anterior.
 
 Requisitos: **Java 17 ou superior** e **Maven**.
 
@@ -124,10 +169,13 @@ O id do servidor também pode vir da variável `TPF_GUILD_ID`.
 
 Na consola, e em `dados-lider/eventos-lider.txt`, aparecem:
 
-- `ARRANQUE` — `master.key` validada e `registos.log` recuperado (com o último LSN);
+- `ARRANQUE` — `master.key` validada, `registos.log` recuperado (com o último LSN),
+  catálogo carregado e hub à escuta no porto;
 - `REPARACAO` — só se havia uma cauda parcial a reparar (ou uma reparação pendente);
 - `REGISTO` — um por escrita durável, com o LSN, autor, canal e tamanho da linha;
 - `SELADO` — um por chunk selado, com `chunkId`, intervalo de LSN e tamanho em claro;
+- `RONDA`, `STORE`, `ACK`, `ACK-REJEITADO`, `DURAVEL`, `SUBREPLICADO`, `ESTADO` — a
+  colocação e a durabilidade do E2-03 (§10.6);
 - `COMANDOS` — `7 comandos registados em <servidor>`;
 - `ARRANQUE` — líder online.
 
@@ -146,6 +194,18 @@ autocomplete.
 | `tpf.pad` | `4096` | `PAD_BYTES`: o texto do chunk é completado até um múltiplo deste valor |
 | `tpf.selagem` | `5000` | `SELAGEM_MS`: tempo máximo (ms) que um chunk fica aberto |
 | `tpf.novaChave` | `false` | aceita criar uma `master.key` nova mesmo existindo dados (perde a capacidade de decifrar os chunks antigos) |
+| `tpf.porto` | `8765` | porto do hub WebSocket (`PORTO`) |
+| `tpf.periodo` | `2000` | `PERIODO_HB_MS`: intervalo entre heartbeats das réplicas |
+| `tpf.suspeita` | `6000` | `SUSPEITA_MS`: silêncio que faz `VIVA → SUSPEITA` (3 heartbeats) |
+| `tpf.morta` | `10000` | `MORTA_MS`: silêncio que faz `→ MORTA` (5 heartbeats) |
+| `tpf.tokenValidade` | `600000` | `TOKEN_VALIDADE_MS`: validade de um token de registo (10 min) |
+| `tpf.r` | `3` | `R`: fator de replicação |
+| `tpf.w` | `2` | `W_MIN`: mínimo absoluto de `ACK` para `DURAVEL` |
+| `tpf.ackTimeout` | `4000` | `ACK_TIMEOUT_MS`: prazo de uma ronda de `STORE` |
+| `tpf.maxRondas` | `3` | `MAX_RONDAS`: tentativas de colocação por chunk (a primeira conta) |
+| `tpf.margem` | `65536` | `MARGEM_BYTES`: folga exigida em cada réplica para receber um chunk |
+| `tpf.alfa` | `1.0` | `ALFA`: expoente da ponderação pelo espaço livre |
+| `tpf.backoffMin` / `tpf.backoffMax` | `1000` / `30000` | `BACKOFF_MIN_MS` / `BACKOFF_MAX_MS` (usadas pela réplica) |
 
 Exemplo com tudo explícito:
 
@@ -154,6 +214,9 @@ java -Dtpf.guild=123456789012345678 \
      -Dtpf.masterKey=master.key \
      -Dtpf.pasta=. \
      -Dtpf.chunkMax=65536 -Dtpf.pad=4096 -Dtpf.selagem=5000 \
+     -Dtpf.porto=8765 -Dtpf.periodo=2000 -Dtpf.suspeita=6000 -Dtpf.morta=10000 \
+     -Dtpf.tokenValidade=600000 -Dtpf.r=3 -Dtpf.w=2 -Dtpf.ackTimeout=4000 \
+     -Dtpf.maxRondas=3 -Dtpf.margem=65536 -Dtpf.alfa=1.0 \
      -jar target/tpf-lider-1.0.jar
 ```
 
@@ -165,7 +228,9 @@ dados-lider/
 ├── eventos-lider.txt   # diário de eventos do líder
 ├── reparacao.intent    # só existe DURANTE uma reparação (ver §5.2); se a encontrar antes
 │                       # de arrancar, houve um crash a meio — o arranque conclui-a
-└── selados/            # chunks cifrados: <chunkId>.bin + <chunkId>.hdr (§5.4)
+├── selados/            # chunks cifrados: <chunkId>.bin + <chunkId>.hdr (§5.4)
+├── catalogo.txt        # onde está cada chunk: chunkId;lsnDe;lsnAte;tamanho;replicas;estado
+└── replicas.txt        # réplicas registadas: id;chavePublicaB64 (uma por linha)
 ```
 
 O caminho é relativo à pasta onde o líder arranca. Para os ficheiros ficarem na raiz do
@@ -705,11 +770,11 @@ Regras de integridade do diário:
 | Comando | Quem pode usar | Validação | Estado |
 | --- | --- | --- | --- |
 | `/registar <texto>` | todos | texto não vazio | **implementado**: responde com o LSN atribuído |
-| `/estado` | todos | — | mostra último LSN, chunks selados e ocupação do chunk aberto |
+| `/estado` | todos | — | **implementado**: último LSN, por réplica estado/ocupação/nº de chunks, e no total chunks `SELADO`, `DURAVEL` e subreplicados |
 | `/recuperar <de> <ate>` | todos | inteiros ≥ 1 e `de` ≤ `ate` | provisório |
 | `/config r <n>` | `admin-arquivo` | inteiro ≥ 1 | provisório |
-| `/replica-token` | `admin-arquivo` | — | provisório |
-| `/replica-remover <id>` | `admin-arquivo` | letras, dígitos, `_` e `-`, até 32 caracteres | provisório |
+| `/replica-token` | `admin-arquivo` | — | **implementado**: token de uso único (10 min), resposta **efémera** |
+| `/replica-remover <id>` | `admin-arquivo` | letras, dígitos, `_` e `-`, até 32 caracteres | **implementado**: revoga a chave, desliga e exclui da colocação |
 | `/rajada <n> <intervalo_ms>` | `admin-arquivo` | `1 ≤ n ≤ 5000` e `intervalo_ms` ≥ 0 | **implementado**: `n` registos pelo caminho de `/registar` |
 
 Notas:
@@ -736,7 +801,10 @@ Notas:
   resposta é o LSN — o registo está durável — e a falha aparece apenas como evento `ERRO` em
   `eventos-lider.txt`.
 
-## 8. Como verificar os critérios de aceitação
+## 8. Como verificar os critérios de aceitação do E2-02
+
+Os critérios do **E2-03** estão em §10.9. As verificações seguintes são as do caminho
+de escrita local (E2-02) e continuam válidas.
 
 Arranque o líder, execute alguns `/registar` e depois, noutra consola:
 
@@ -1020,6 +1088,12 @@ grep -h "Tests run" target/surefire-reports/*.txt
   intervalo (LSN, autor, canal, texto e instante em milissegundos, que é a resolução do
   formato binário) — 200 no total, com LSN 1..200 sem saltos.
 
+Os testes do **E2-03** (sem Discord nem rede real) são `WireMensagensTest`, `PlacementTest`,
+`ReplicaRegistryTest`, `CatalogTest`, `PubSubHubTest` e `LeaderBotReplicacaoTest`; a lista
+detalhada está em §10.12. `PubSubHubTest` injeta um `CanalLigacao` falso (o hub não abre
+sockets) e `LeaderBotReplicacaoTest` injeta um `Publicador` que captura os `STORE` em vez de
+os enviar pela rede.
+
 Os testes de fail-stop usam um canal injetado (`LogRegistos.paraTestes` com uma implementação
 de `LogRegistos.Canal` em memória), porque não há forma de provocar falhas de I/O
 determinísticas num `FileChannel` real. O canal de teste permite escolher **quais** as chamadas
@@ -1116,3 +1190,589 @@ comandos, e provoca a falha do chunk ocupando o nome `selados/` com um ficheiro 
   nova torna os chunks anteriores indecifráveis e o líder ficaria a arrancar sobre um arquivo
   que não sabe ler. O arranque valida essa combinação antes de tocar no `Wire` e recusa,
   exigindo `-Dtpf.novaChave=true` para uma rotura consciente.
+## 10. Sprint E2-03 — hub, réplicas, colocação e catálogo
+
+Esta secção documenta o que o sprint E2-03 acrescenta. O caminho de escrita local
+(§5) e a cifra (§5.4) mantêm-se exatamente como no E2-02; o que muda é o que
+acontece **depois** de o chunk ser selado e gravado em `selados/`.
+
+### 10.1. Protocolo textual
+
+Todas as mensagens são **texto numa trama WebSocket**, com campos separados por `;`
+e bytes binários em Base64. O hub acrescenta apenas duas mensagens de
+encaminhamento, `SUB;<topico>` e `PUB;<topico>;<mensagem>`.
+
+| Mensagem | Quem envia | Formato | Uso |
+| --- | --- | --- | --- |
+| `OLA` | réplica | `OLA;<id>` ou `OLA;<id>;<chavePublicaB64>;<token>` | início de ligação; a segunda forma é o 1.º registo |
+| `DESAFIO` | hub | `DESAFIO;<nonceB64>` | nonce de 32 bytes, novo por ligação, enviado diretamente |
+| `PROVA` | réplica | `PROVA;<id>;<assinaturaB64>` | assinatura Ed25519 de `tpf-registo\|<id>\|<nonceB64>` (UTF-8) |
+| `SUB` | réplica | `SUB;<topico>` | só `tpf-r-<o seu id>` e `tpf-ctl` |
+| `PUB` | ambos | `PUB;<topico>;<mensagem>` | encaminhamento; a réplica só publica em `tpf-lider` |
+| `HB` | réplica | `HB;<id>;<usados>;<quota>` | dentro de `PUB;tpf-lider;...` |
+| `INVENTARIO` | réplica | `INVENTARIO;<id>;<chunkId1>,<chunkId2>,...` | dentro de `PUB;tpf-lider;...`; completo após cada ligação |
+| `ACK` | réplica | `ACK;<id>;<chunkId>;<sha256>` | dentro de `PUB;tpf-lider;...`; só depois de gravar |
+| `STORE` | líder | `STORE;<chunkId>;<hdrB64>;<binB64>` | dentro de `PUB;tpf-r-<id>;...` |
+
+O `hdrB64` é o conteúdo do `.hdr` (`keyVersion;salt;nonce\n`) e o `binB64` é o
+conteúdo do `.bin` (texto cifrado + tag GCM). Não há mensagem de confirmação de
+autenticação: a réplica envia `PROVA` e, **de seguida**, `SUB`; o WebSocket preserva
+a ordem e o hub processa a prova antes das subscrições. Se a prova falhar, o hub
+fecha a ligação e as `SUB` nunca são aceites.
+
+Uma trama `STORE` com um chunk de 64 KiB em claro tem cerca de 87 KiB em Base64; o
+servidor Java-WebSocket é criado com um limite de 4 MiB por trama
+(`Draft_6455`), para não fragmentar mal os chunks.
+
+### 10.2. `PubSubHub`
+
+O hub corre no **mesmo processo** do `LeaderBot` e estende
+`org.java_websocket.server.WebSocketServer`. Cada ligação tem uma máquina de
+estados:
+
+```
+NOVA --OLA--> DESAFIADA --PROVA válida--> AUTENTICADA
+```
+
+Regras implementadas:
+
+- antes de `AUTENTICADA`, só são aceites `OLA` e `PROVA`; `SUB`, `PUB`, um segundo
+  `OLA` ou uma `PROVA` sem desafio desligam a ligação (código 1008) e registam
+  `ERRO`;
+- o nonce tem 32 bytes de `SecureRandom`, é novo em cada ligação e é **descartado
+  após uma tentativa**, mesmo que a assinatura seja inválida (uma segunda `PROVA`
+  na mesma ligação é recusada);
+- uma réplica nova (`id` ausente de `replicas.txt`) tem de enviar chave pública e
+  token; o token tem de existir, não ter sido usado e ter menos de
+  `TOKEN_VALIDADE_MS`; a chave e o token só são aceites **depois** de uma `PROVA`
+  válida, e nesse momento o token é consumido e `replicas.txt` é reescrito
+  atomicamente;
+- um `OLA` de um `id` já registado com **outra** chave é recusado; com a mesma
+  chave, `OLA;<id>` (sem chave/token) é suficiente e o desafio-resposta continua a
+  ser obrigatório;
+- uma réplica só pode subscrever `tpf-r-<o seu id>` e `tpf-ctl`, e só pode publicar
+  em `tpf-lider`; qualquer outra subscrição/publicação desliga e regista `ERRO`;
+- `publish(topico, mensagem)` envia `PUB;<topico>;<mensagem>` apenas às ligações
+  autenticadas que subscreveram o tópico;
+- as mensagens `PUB;tpf-lider;...` são entregues ao líder **em processo**, com o
+  `id` autenticado da ligação (nunca com o id escrito pelo cliente);
+- `/replica-remover` chama `removerReplica(id)`: remove a chave de `replicas.txt`,
+  fecha as ligações autenticadas com esse id e remove a réplica do
+  `ReplicaRegistry`. As cópias no catálogo ficam para a reconciliação do próximo
+  sprint.
+
+`replicas.txt` tem uma linha por réplica, em UTF-8:
+
+```
+<id>;<chavePublicaB64>\n
+```
+
+A quota **não** é guardada neste ficheiro: chega em cada `HB`, como pede o E2-03
+(o quadro geral do Epico2 mostra `replica;chavePublica;quota`, mas o enunciado
+deste sprint fixa `id;chavePublicaB64` e a quota vem no heartbeat). A escrita é
+temporário + `ATOMIC_MOVE`, com `fsync` ao diretório.
+
+O token é gerado por `/replica-token` com 24 bytes de `SecureRandom` em Base64
+URL-safe; a resposta do Discord é **efémera** e o token **não** é escrito em
+`eventos-lider.txt`. Os tokens vivem em memória: reiniciar o líder invalida os
+tokens ainda não usados (é preciso gerar outro).
+
+### 10.3. `HeartbeatMonitor`, `ReplicaRegistry` e estados
+
+Para cada réplica, o líder guarda:
+
+| Campo | Origem |
+| --- | --- |
+| `estado` | `VIVA`, `SUSPEITA` ou `MORTA` |
+| `quota` / `usados` | último `HB` (`PUB;tpf-lider;HB;...`) |
+| `reservados` | soma dos chunks já enviados e ainda sem `ACK` |
+| último heartbeat | `HeartbeatMonitor` |
+
+O espaço livre efetivo é `livre = quota − usados − reservados`. Um `HB` atualiza
+quota/usados, reinicia o monitor e passa a réplica a `VIVA`. `atualizarEstados(agora)`
+aplica:
+
+- `SUSPEITA` a partir de `SUSPEITA_MS` (6000 ms = 3 × 2000 ms);
+- `MORTA` a partir de `MORTA_MS` (10000 ms = 5 × 2000 ms);
+- `MORTA → VIVA` no primeiro `HB` seguinte (regresso).
+
+O líder corre `atualizarEstados` a cada `PERIODO_HB_MS / 2` e também no início de
+cada `reserveAndChoose`, para nunca escolher com um estado desatualizado. Cada
+transição emite `ESTADO <id> <antigo> -> <novo>`.
+
+**Reserva atómica.** `reserveAndChoose(chunkId, tamanho, count, exclude)` constrói
+os candidatos (não `MORTA`, com `livre >= tamanho + MARGEM_BYTES`), chama
+`Placement.choose` e soma `tamanho` aos `reservados` das escolhidas, **tudo dentro
+da mesma secção sincronizada**. Ao receber um `ACK` válido, `confirmarReserva`
+passa `tamanho` de `reservados` para `usados`; ao expirar `ACK_TIMEOUT_MS`,
+`libertar` retira as reservas que não foram confirmadas. Sem a reserva, dois
+chunks selados entre dois heartbeats poderiam escolher a mesma réplica com base no
+mesmo espaço livre e exceder a quota.
+
+As réplicas registadas em `replicas.txt` mas ainda sem heartbeat neste arranque
+entram no registo como `MORTA` (e aparecem assim em `/estado`), até ao primeiro
+`HB`.
+
+### 10.4. `Placement`
+
+A pontuação de cada par (chunk, réplica) é
+
+```
+u(c, r) = ((primeiros 53 bits de SHA-256(c + "|" + r)) + 0.5) / 2^53   ∈ ]0,1[
+pontuação(c, r) = livre(r)^ALFA / -ln(u(c, r))
+```
+
+`choose` filtra `livre >= tamanho + MARGEM_BYTES`, ordena por pontuação
+decrescente (desempate por id) e devolve até `count` ids. É determinística para o
+mesmo chunk e o mesmo estado, e a ordem de iteração da coleção de candidatos não
+altera o resultado.
+
+Distribuição medida com 10 000 chunkIds e quotas 8/2/4/6 MB (a mesma da
+experiência 5; `mvn -q test` fixa estes valores):
+
+| α | 8 MB | 2 MB | 4 MB | 6 MB |
+| --- | --- | --- | --- | --- |
+| 0 | 25,6 % | 24,8 % | 24,7 % | 24,9 % |
+| 1 | 40,5 % | 9,8 % | 19,8 % | 30,0 % |
+| 2 | 53,8 % | 3,2 % | 13,2 % | 29,9 % |
+
+Com α = 0 a escolha é uniforme entre as candidatas, mas o filtro de espaço
+continua a atuar; com α = 2 as réplicas grandes dominam e as pequenas só são
+escolhidas quando as grandes enchem.
+
+### 10.5. `Catalog`
+
+`catalogo.txt`, uma linha por chunk, em UTF-8:
+
+```
+chunkId;lsnDe;lsnAte;tamanho;replicas;estado\n
+```
+
+Exemplo:
+
+```
+ab12…;1;75;8208;r1,r3;DURAVEL
+cd34…;76;90;4112;r2;SELADO
+```
+
+- `tamanho` é o tamanho do `.bin` (texto cifrado + tag), que é o que ocupa quota na
+  réplica;
+- `replicas` são as cópias **confirmadas por ACK**, separadas por vírgulas;
+- `SELADO` = ainda não cumpre o quórum; `DURAVEL` = cumpre
+  `max(W_MIN, ⌊R/2⌋+1)` (2 com R = 3, 3 com R = 5);
+- **subreplicado** é derivado (`cópias < R`), não é um estado: um chunk pode estar
+  `DURAVEL` com 2/3 cópias;
+- `adicionar`, `confirmar` e `gravarAtomico` são sincronizados; o ficheiro é
+  reescrito a cada alteração com temporário + `ATOMIC_MOVE` e `fsync` ao
+  diretório;
+- o catálogo é carregado no arranque; um ficheiro com linhas inválidas, `chunkId`
+  repetido ou estado desconhecido aborta o arranque (fail-fast, como o log).
+
+### 10.6. Caminho de escrita replicada
+
+Depois de o chunk ser selado e gravado em `selados/`:
+
+1. entra no catálogo como `SELADO`;
+2. `reserveAndChoose(chunkId, tamanho, R, {})`; se devolver menos de R, regista
+   `SUBREPLICADO <chunkId> <previstas>/<R>` e envia às disponíveis;
+3. `STORE` é publicado no tópico `tpf-r-<id>` de cada escolhida;
+4. um `ACK` só é aceite se **(1)** o hash for o `chunkId`, **(2)** o `<id>` da
+   mensagem for o id **autenticado** da ligação e **(3)** essa réplica tiver
+   recebido o `STORE` deste chunk; a réplica é então acrescentada às cópias;
+5. o chunk passa a `DURAVEL` quando os `ACK` válidos atingem
+   `max(W_MIN, ⌊R/2⌋+1)`;
+6. ao fim de `ACK_TIMEOUT_MS`, se houver menos de R cópias, as reservas pendentes
+   são libertadas e uma nova ronda chama
+   `reserveAndChoose(chunkId, tamanho, R − confirmadas, tentadas)`, excluindo
+   **todas** as réplicas já tentadas; repete até R cópias ou `MAX_RONDAS`
+   (continua mesmo depois de o chunk estar `DURAVEL`);
+7. o catálogo é reescrito atomicamente em cada alteração.
+
+Eventos no líder (coluna `evento`; o detalhe é o resto da linha):
+
+| Evento | Detalhe | Quando |
+| --- | --- | --- |
+| `STORE` | `<chunkId> -> <id>` | pedido enviado a uma réplica |
+| `ACK` | `<chunkId> <id>` | ACK válido aplicado |
+| `ACK-REJEITADO` | `<chunkId> <id> <motivo>` | hash errado, id diferente ou sem STORE |
+| `DURAVEL` | `<chunkId>` | o chunk atinge o quórum pela primeira vez |
+| `SUBREPLICADO` | `<chunkId> <n>/<R>` | não há candidatas suficientes |
+| `RONDA` | `<chunkId> <k>` | início de cada ronda (k = 1, 2, …) |
+| `ESTADO` | `<id> <antigo> -> <novo>` | transição de estado |
+| `REGISTO-REPLICA` | `<id> registada em replicas.txt` | 1.º registo concluído |
+| `REMOVIDA` | `<id>` | `/replica-remover` |
+
+Um `ACK` rejeitado **não** altera o catálogo nem as reservas. As cópias em
+réplicas `MORTA` continuam no catálogo neste sprint (a reconciliação que as
+repara/remove é o sprint seguinte).
+
+### 10.7. Comandos Discord
+
+| Comando | Quem | Comportamento no E2-03 |
+| --- | --- | --- |
+| `/replica-token` | `admin-arquivo` | gera token real, resposta **efémera**, validade 10 min, uso único |
+| `/replica-remover <id>` | `admin-arquivo` | revoga a chave, fecha a ligação e exclui da colocação; cópias ficam para reconciliação |
+| `/estado` | todos | por réplica: estado, `usados/quota` e nº de chunks; total de `SELADO`, `DURAVEL` e subreplicados |
+| `/config r <n>` | `admin-arquivo` | provisório (não altera R neste sprint) |
+| `/recuperar <de> <ate>` | todos | provisório |
+
+O token nunca é escrito em `eventos-lider.txt` nem em qualquer ficheiro; só existe
+na resposta efémera do Discord e no argumento com que a réplica é arrancada.
+
+### 10.8. Como lançar N réplicas
+
+Compile os dois projetos:
+
+```bash
+cd tpf-lider  && mvn -q package
+cd ../tpf-replica && mvn -q package
+```
+
+Arranque o líder (com o token do bot e o id do servidor, §2 e §3):
+
+```bash
+cd tpf-lider
+java -Dtpf.guild=<ID_DO_SERVIDOR> -jar target/tpf-lider-1.0.jar
+# ou: mvn -q compile exec:java -Dtpf.guild=<ID_DO_SERVIDOR>
+```
+
+No Discord, execute `/replica-token` uma vez por réplica e guarde cada token. Depois,
+num terminal (ou pasta) por réplica:
+
+```bash
+mkdir -p /tmp/tpf/A && cd /tmp/tpf/A
+java -jar /caminho/para/tpf-replica/target/tpf-replica-1.0.jar \
+     A ws://localhost:8765 8388608 <tokenA>
+
+mkdir -p /tmp/tpf/B && cd /tmp/tpf/B
+java -jar /caminho/para/tpf-replica/target/tpf-replica-1.0.jar \
+     B ws://localhost:8765 2097152 <tokenB>
+
+mkdir -p /tmp/tpf/C && cd /tmp/tpf/C
+java -jar /caminho/para/tpf-replica/target/tpf-replica-1.0.jar \
+     C ws://localhost:8765 4194304 <tokenC>
+
+mkdir -p /tmp/tpf/D && cd /tmp/tpf/D
+java -jar /caminho/para/tpf-replica/target/tpf-replica-1.0.jar \
+     D ws://localhost:8765 6291456 <tokenD>
+```
+
+As quotas são 8, 2, 4 e 6 MB (8 388 608, 2 097 152, 4 194 304 e 6 291 456 bytes).
+Cada pasta tem `dados-<id>/` e `eventos-<id>.txt`; também pode correr todas na
+mesma pasta, porque os nomes incluem o id. O `<token>` só é necessário no primeiro
+registo (ou se o líder tiver perdido `replicas.txt`); nas ligações seguintes basta
+`ReplicaService <id> <url> <quotaBytes>`.
+
+Se alterar `-Dtpf.periodo`, `-Dtpf.backoffMin` ou `-Dtpf.backoffMax` no líder,
+passe os mesmos valores à réplica (cada processo lê as suas propriedades).
+
+### 10.9. Como verificar os critérios e as experiências
+
+Os critérios do E2-03, com a evidência correspondente:
+
+1. **Registo com token.** `/replica-token` + arranque de uma réplica nova ⇒
+   `REGISTO-REPLICA` em `eventos-lider.txt`, linha em `replicas.txt` e `/estado` a
+   mostrá-la. Repetir o mesmo token noutra réplica, usar um token com mais de
+   10 min (ou reiniciar o líder, que os perde) ou assinar a `PROVA` com outra
+   chave ⇒ `ERRO` e nenhuma linha nova em `replicas.txt`.
+2. **Reconexão.** Parar a réplica (`kill -9`) e observar em `/estado`
+   `VIVA → SUSPEITA` ao fim de ~6 s e `SUSPEITA → MORTA` ao fim de ~10 s; voltar a
+   arrancá-la ⇒ `MORTA → VIVA` e `INVENTARIO` no líder. Os eventos `ESTADO` ficam
+   no diário.
+3. **Backoff.** Parar o líder e olhar para `eventos-<id>.txt` da réplica: os
+   intervalos são 1, 2, 4, 8, 16 e 30 s (máximo); ao voltar a ligar, o próximo é
+   outra vez 1 s (`LIGADO` repõe o atraso).
+4. **Rajada.** Com 3 ou 4 réplicas vivas, `/rajada 50 0` (ou 50 `/registar`):
+   `grep -c ';DURAVEL;' dados-lider/eventos-lider.txt` deve acompanhar os chunks.
+   Para cada chunk, `awk -F';' '$6=="DURAVEL"{print $5}' catalogo.txt` deve dar 3
+   ids distintos. Em cada réplica, o nome de cada `.bin` continua a ser o
+   SHA-256 do conteúdo:
+   `for f in dados-<id>/*.bin; do [ "$(sha256sum "$f" | cut -d' ' -f1).bin" = "$(basename "$f")" ] || echo ERRO; done`.
+5. **Distribuição.** Os testes `PlacementTest` medem 10 000 chunks com quotas
+   8/2/4/6 MB e α = 0, 1 e 2; a tabela de §10.4 tem os valores. Não é preciso
+   escrever chunks: `Placement.choose` é chamado diretamente, sem reservas.
+6. **Menos de R.** Com 2 réplicas vivas, cada chunk fica com 2 cópias, `DURAVEL`
+   (2 ≥ quórum), e `subreplicados` em `/estado` aumenta; com 1, fica `SELADO`,
+   `SUBREPLICADO 1/3` e subreplicado.
+7. **Quota.** Arranque uma réplica com quota muito pequena: deixa de ser escolhida
+   quando `livre < tamanho + MARGEM_BYTES`; se receber um `STORE` que não cabe,
+   regista `QUOTA` em `eventos-<id>.txt` e não publica `ACK`.
+8. **Hash errado.** Com 4 réplicas, altere uma (teste/falha propositada) para
+   responder com hash errado: o líder regista `ACK-REJEITADO`, o chunk fica
+   `DURAVEL` com as outras duas e, ao fim de `ACK_TIMEOUT_MS`, a ronda 2 envia
+   `STORE` à quarta réplica (visível em `RONDA <chunkId> 2` e `STORE ... -> <4.ª>`).
+9. **Id de ACK.** Uma réplica que envie `ACK` com o id de outra é recusada
+   (`ACK-REJEITADO ... id da mensagem (...) diferente do id autenticado`), mesmo
+   que o hash esteja certo.
+
+Inspeção rápida do catálogo e das cópias:
+
+```bash
+# uma linha por chunk, com o número de cópias confirmadas
+awk -F';' '{n=split($5,a,","); print $1, n, $6}' dados-lider/catalogo.txt
+
+# contagens por estado e subreplicados
+awk -F';' '{n[$6]++; if (split($5,a,",")<3) sub++} END {for (e in n) print e, n[e]; print "subreplicados", sub}' dados-lider/catalogo.txt
+
+# nenhum texto em claro nos chunks da réplica
+grep -R "o-meu-texto" /tmp/tpf/A/dados-A/ && echo "ERRO: texto em claro" || echo "ok"
+
+# a réplica não tem master.key nem catálogo
+ls /tmp/tpf/A/dados-A/ | grep -E 'master|catalogo' && echo "ERRO" || echo "ok: só chaves e chunks"
+```
+
+### 10.10. Concorrência: estruturas partilhadas, threads e sincronização
+
+Fontes de threads no processo do líder:
+
+| Thread | O que faz |
+| --- | --- |
+| threads do JDA (eventos de comandos/mensagens) | `/registar`, `#arquivo`, `/rajada`, `/estado`, `/replica-token`, `/replica-remover` |
+| threads do Java-WebSocket (`onOpen`, `onMessage`, `onClose`, `onError`) | OLA/PROVA/SUB/PUB das réplicas; entrega de HB/ACK ao líder |
+| `tpf-agendador` (um `ScheduledExecutorService`) | selagem por tempo, `ACK_TIMEOUT_MS`, atualização periódica de estados, `/rajada` |
+| main / shutdown hook | arranque, fecho limpo |
+
+Estruturas partilhadas e proteção:
+
+| Estrutura | Threads | Proteção |
+| --- | --- | --- |
+| `LeaderBot.chunkAberto`, `selagemAgendada`, `colocacoes` | JDA, agendador, hub (ACK) | métodos `synchronized` da instância (`registar`, `selarPorTempo`, `colocarChunk`, `receberAck`, `expirar`, `fechar`) |
+| `Catalog` (`chunks`, ficheiro `catalogo.txt`) | JDA (selagem), hub (ACK), agendador, `/estado` | todos os métodos `synchronized`; escrita atómica dentro do lock |
+| `ReplicaRegistry` (`replicas`, reservas) | hub (HB/auth), agendador, JDA (`/estado`), selagem | todos os métodos `synchronized`; `reserveAndChoose` faz escolha + reserva numa só secção |
+| `PubSubHub.replicas` / `tokens` | threads WebSocket, JDA (`/replica-token`, `/replica-remover`) | `synchronized` no hub (`replicas`) e no mapa `tokens`; a chave só é publicada depois de `replicas.txt` estar gravado |
+| `PubSubHub.subscricoes` | threads WebSocket, publicação do líder | `synchronized` no mapa; `publish` copia a lista de destinos e envia fora do lock |
+| `Eventos` | todas | `synchronized` + `force(true)` por linha |
+| `LogRegistos` | JDA, agendador | métodos `synchronized` do próprio log |
+
+Ordem de locks: `LeaderBot` → `Catalog`/`ReplicaRegistry` → `Eventos`; o hub
+adquire `subscricoes` sem deter o lock do `LeaderBot`, e as callbacks do hub
+entram no `LeaderBot` sem deter `subscricoes`. Não há um caminho que adquira os
+locks pela ordem inversa, pelo que não há inversão cíclica. O `Placement` é
+stateless depois de construído e é chamado dentro do lock do registry.
+
+Custo consciente: o `LeaderBot` mantém o lock enquanto lê o `.bin`/`.hdr` de
+`selados/`, os converte para Base64 e publica os `STORE`. Isso serializa a
+selagem com os ACK, mas o trabalho é de alguns milissegundos por chunk de 64 KiB
+e garante que a reserva, a publicação e o estado do catálogo são coerentes. Os
+envios do WebSocket são assíncronos (o Java-WebSocket coloca a trama na fila da
+ligação); a publicação não espera pela rede.
+
+No processo da réplica: a thread do `java.net.http.WebSocket` entrega as tramas
+ao `processador` (uma thread, ordem preservada), a `SessaoEnvio` (uma thread)
+serializa `sendText` (o JDK só permite um envio pendente por ligação) e o
+`agendador` publica heartbeats e agenda religações. `Armazem` e `EventosReplica`
+são `synchronized`; o `Armazem` só é tocado pelo processador.
+
+### 10.11. Questões de reflexão
+
+**1. Porque é que o token é necessário, se a réplica já se autentica com Ed25519?
+O que acontece se um token for intercetado nos 10 minutos de validade?**
+
+O Ed25519 prova **continuidade** de uma identidade já conhecida, mas qualquer
+máquina pode gerar um par de chaves novo e dizer que é a réplica `X`. O token é a
+**autorização de inscrição**: liga a chave pública nova a uma decisão do
+administrador, tomada no Discord. Sem ele, o conjunto de réplicas seria aberto a
+qualquer pessoa que soubesse o URL do hub — e o modelo assume réplicas
+voluntárias, não hostis à partida, mas o líder não deve aceitar espaço de quem não
+foi autorizado. O token é de uso único para que a sua reutilização (por exemplo,
+a partir de um log ou de uma captura) não volte a registar outra chave, e vale
+10 minutos para limitar a janela de exposição.
+
+Se for intercetado dentro da validade, quem o tiver pode usá-lo **uma vez** para
+registar a sua própria chave com um `id` novo (ou com um `id` ainda não usado) e
+passar a receber chunks. Não consegue, porém, substituir a chave de uma réplica
+já registada: um `OLA` com o mesmo `id` e chave diferente é recusado. Também
+consegue consumir o token e impedir o registo legítimo (negação de serviço). A
+defesa é entregar o token por um canal privado (a resposta efémera do Discord),
+usá-lo imediatamente, e usar `wss://` para que não seja lido da rede. Depois de
+consumido, o token desaparece; o administrador pode revogar a chave com
+`/replica-remover`.
+
+**2. Porque é que a réplica assina o `id` e um prefixo juntamente com o nonce, e
+não apenas o nonce?**
+
+Assinar só o nonce provaria posse da chave, mas não **para que identidade** nem
+**em que contexto**. O prefixo `tpf-registo|` faz separação de domínio: a mesma
+chave pode ser usada noutro protocolo e uma assinatura produzida aí não deve valer
+aqui. O `id` liga a prova à identidade anunciada no `OLA`; sem ele, uma assinatura
+obtida numa ligação que se diz `A` poderia ser reapresentada numa ligação que se
+diz `B` (o hub também compara os ids, mas a assinatura passa a ser
+autocontida). O nonce, novo em cada ligação e descartado após uma tentativa,
+impede repetir uma `PROVA` antiga; o prefixo e o id impedem que a assinatura seja
+reciclada noutro contexto. É a mesma razão pela qual o `aad` do AES-GCM inclui a
+versão, o salt e o nonce: cada prova fica ligada a todos os parâmetros que a
+tornam única.
+
+**3. Porque é que a escolha e a reserva têm de acontecer na mesma secção
+sincronizada? Dê um exemplo de execução que falharia sem isso.**
+
+Porque a decisão depende do espaço livre, que é alterado pela própria decisão.
+Exemplo: uma réplica B com `livre = 100` bytes, margem 0, e dois chunks de 60
+bytes selados em paralelo. Sem atomicidade, as duas threads leem `livre = 100`,
+ambas calculam a pontuação e ambas escolhem B; cada uma reserva 60 e B fica com
+120 reservados, acima da quota. Com a escolha e a reserva no mesmo `synchronized`,
+a primeira reserva 60 e deixa `livre = 40`; a segunda já não considera B elegível
+(`40 < 60`) e escolhe outra réplica ou devolve vazio, originando `SUBREPLICADO`.
+O mesmo argumento se aplica ao `ACK`: `confirmarReserva` move a reserva para
+`usados` para que o espaço não fique sobrestimado até ao heartbeat seguinte. O
+teste `ReplicaRegistryTest.reserveAndChooseEhAtomicaEntreDuasThreads` fixa
+exatamente este cenário.
+
+**4. Porque é que a durabilidade exige um mínimo absoluto (`W_MIN`) e também a
+maioria de R? O que muda com `R = 5`? Que risco se corre com W = 1, e que custo
+teria exigir R confirmações?**
+
+`W_MIN` é um piso de tolerância a falhas: com R = 3, exigir só a maioria (2) já
+é o mesmo que W_MIN = 2, mas se R for 2 a maioria é 2 e W_MIN garante que nunca se
+desce a 1. A maioria de R garante que dois grupos de réplicas não possam ambos
+dizer que têm uma cópia durável sem se intersetarem — é o mesmo princípio dos
+quóruns, aplicado aqui à durabilidade. Com R = 5, o quórum sobe para
+`max(2, 3) = 3`; um chunk passa a `DURAVEL` com 3 ACK e tolera a perda de 2
+réplicas, mas precisa de mais tempo e mais espaço (5 cópias). Com W = 1, um único
+`ACK` torna o chunk durável: se essa réplica falhar logo a seguir (ou tiver
+mentido), o chunk perde-se e o líder já o anunciou como durável. Exigir R
+confirmações maximiza a durabilidade (todas as cópias), mas aumenta a latência
+até `ACK_TIMEOUT_MS` no pior caso, o tráfego e a probabilidade de uma ronda
+falhar por uma réplica lenta; além disso, com menos de R réplicas vivas nenhum
+chunk ficaria durável, mesmo com maioria. O compromisso `max(W_MIN, maioria)`
+tolera uma minoria de falhas sem esperar por todas.
+
+**5. Num sistema com vários escritores, uma maioria serve para garantir
+consistência (quórum). Porque é que aqui não há esse problema?**
+
+Porque não há versões concorrentes do mesmo dado: os chunks são **imutáveis** e
+**endereçados pelo hash** do conteúdo. Um `chunkId` identifica exatamente um
+conteúdo; duas cópias com o mesmo id são iguais, e escrever outra vez o mesmo
+chunk é um no-op. O líder é único e serializa a atribuição de LSN, a selagem, a
+colocação e a confirmação; não há dois escritores a propor valores diferentes para
+a mesma posição. A maioria não serve para escolher entre valores, serve apenas
+como **limiar de durabilidade** (quantas cópias independentes existem). Se o
+líder cair, as escritas param (ponto único de falha) e a recuperação do próximo
+sprint reconstrói o estado a partir do manifesto e dos chunks; como os chunks não
+podem ser forjados (hash + GCM), uma réplica não consegue introduzir uma versão
+alternativa.
+
+**6. Qual é o efeito de α na distribuição? Com α = 0, o espaço livre ainda
+influencia a escolha de alguma forma?**
+
+A pontuação é `livre^α / -ln(u)`. Com α = 1, a probabilidade de ser a primeira
+escolhida é proporcional ao espaço livre; com α = 0, `livre^0 = 1` e a pontuação
+depende só do hash, pelo que a escolha é uniforme entre as candidatas. O espaço
+livre continua a influenciar através do **filtro** `livre >= tamanho +
+MARGEM_BYTES`: uma réplica cheia deixa de ser candidata, independentemente do α.
+Com α = 2, as réplicas grandes são favorecidas de forma quadrática; as pequenas
+raramente são primeiras e enchem mais devagar (ou nunca, se as grandes tiverem
+sempre espaço). A experiência 5 mede ~40 %/10 % para 8/2 MB com α = 1, ~25 % para
+todas com α = 0 e ~54 %/3 % com α = 2. α = 0 tende a esgotar primeiro a réplica
+mais pequena em termos **relativos**, porque recebe a mesma fração absoluta de
+chunks mas tem menos capacidade; α = 1 tende a igualar a ocupação relativa.
+
+**7. Porque é que a réplica só pode enviar `ACK` depois de gravar os ficheiros
+com `ATOMIC_MOVE`?**
+
+Porque o `ACK` é a única evidência que o líder tem de que a cópia existe. Se a
+réplica respondesse antes de gravar e falhasse a seguir (crash, disco cheio,
+processo morto), o líder contaria uma cópia que não existe e poderia declarar
+`DURAVEL` um chunk com menos de W cópias reais; no limite, nenhuma réplica teria
+os bytes e o registo perder-se-ia apesar de anunciado como durável. O
+`ATOMIC_MOVE` garante que um leitor nunca vê um `.bin` a meio: ou o ficheiro
+antigo (no caso de reposição) ou o novo completo. Escrever primeiro o `.hdr` e
+depois o `.bin`, com `force(true)` e `fsync` ao diretório, e só então publicar o
+`ACK`, fecha a janela: quando o líder recebe o `ACK`, os dois ficheiros estão
+duráveis. Se a réplica morrer entre os dois moves, o `.hdr` órfão é inofensivo e
+um novo `STORE` completa o par (o teste `completarHdrEmFaltaMantemOBin` fixa
+isso).
+
+**8. Porque é que o líder usa o id autenticado da ligação, e não o `<id>` escrito
+no `ACK`?**
+
+Porque o `<id>` do `ACK` é conteúdo controlado pelo cliente. Uma réplica
+autenticada como `A` poderia escrever `ACK;B;<chunkId>;<hash>` e fazer o líder
+creditar a cópia a `B`, que não a tem: o catálogo ficaria errado, o chunk poderia
+ficar `DURAVEL` com menos cópias reais e a colocação seria enganada. O id
+autenticado é o que o hub obteve da `PROVA` Ed25519 e está ligado à chave pública
+registada; é a única identidade em que o líder pode confiar. A validação
+`ACK;B;...` numa ligação de `A` é recusada com `ACK-REJEITADO` (experiência 9). O
+mesmo princípio se aplica ao `HB`: um heartbeat com o id de outra réplica é
+ignorado e registado como `ERRO`.
+
+### 10.12. Testes automáticos do E2-03
+
+```bash
+cd tpf-lider && mvn -q test
+cd ../tpf-replica && mvn -q test
+```
+
+Novos testes do líder (sem Discord nem rede real):
+
+- `WireMensagensTest` — round-trip de OLA/DESAFIO/PROVA/SUB/PUB/HB/ACK/STORE,
+  rejeição de campos em falta e quórum `max(W_MIN, ⌊R/2⌋+1)`.
+- `PlacementTest` — determinismo, filtro de espaço/exclusão, distribuição com
+  α = 0/1/2 (10 000 chunks, quotas 8/2/4/6 MB) e `u ∈ ]0,1[`.
+- `ReplicaRegistryTest` — transições `VIVA → SUSPEITA → MORTA → VIVA` com os
+  limites exatos, `reserveAndChoose` atómica entre duas threads, `confirmar`/
+  `libertar`, exclusão de `MORTA` e permanência de `SUSPEITA`.
+- `CatalogTest` — formato, transição `SELADO`/`DURAVEL` com R = 3 e R = 5,
+  escrita atómica, recarregamento, duplicação e ficheiro inválido.
+- `PubSubHubTest` — primeiro registo com token, prova inválida que não consome o
+  token, token reutilizado/expirado, replay de `PROVA`, `OLA` com outra chave,
+  mensagens fora de ordem, subscrições/publicações proibidas, encaminhamento de
+  `publish`, `verificarProva`, `removerReplica` e recarregamento de
+  `replicas.txt`.
+- `LeaderBotReplicacaoTest` — STORE para R réplicas, rejeição de ACK com hash
+  errado, id diferente e sem STORE, `DURAVEL` com 2 ACK, nova ronda após timeout
+  para a quarta réplica (falha propositada), 2 réplicas ⇒ `DURAVEL` e
+  subreplicado, 1 réplica ⇒ `SELADO`, e HB com id alheio ignorado.
+- `LeaderBotHubIntegracaoTest` — percurso completo líder + hub + três ligações
+  de teste: OLA/PROVA/SUB, `HB` pelo hub, selagem, `STORE` publicado pelo hub,
+  `ACK` pelo hub com o id autenticado e catálogo `DURAVEL`.
+
+Na réplica: `WireTest` (formato), `ChavesTest` (persistência, permissões,
+par incompleto/incoerente) e `ArmazemTest` (quota, hash, escrita atómica,
+duplicado sem reescrita, `usados` recalculados no arranque, `.hdr` em falta,
+`.bin` corrompido).
+
+### 10.13. Limitações conhecidas
+
+- **Sem reconciliação/manifesto/`DELETE`/`FETCH`/`POSSE?`/`ArquivoCheck`.** Ficam
+  para o sprint seguinte. Consequências: um chunk cujas cópias fiquem em réplicas
+  `MORTA` continua no catálogo; um chunk que fique `SELADO` por falta de
+  candidatas não é reparado automaticamente; as cópias de uma réplica removida
+  não são apagadas nem retiradas do catálogo.
+- **As rondas pendentes vivem em memória.** Se o líder reiniciar, os `STORE`
+  já publicados e os temporizadores perdem-se; o catálogo conserva os chunks
+  `SELADO`/`DURAVEL` e a reconciliação do próximo sprint os repõe. `MAX_RONDAS`
+  limita o esforço de uma execução.
+- **`/config r` não altera R** neste sprint (provisório); o catálogo foi
+  construído com o R do arranque.
+- **Tokens em memória.** Reiniciar o líder invalida tokens não usados; é preciso
+  `/replica-token` outra vez. O token é passado na linha de comandos da réplica e
+  fica visível em `ps`/histórico; para os ensaios locais é aceitável, num ambiente
+  real seria um segredo a proteger (ficheiro com permissões, variável de
+  ambiente, etc.).
+- **Uma chave nova para um id já registado é recusada.** Se a réplica perder
+  `dados-<id>/` e gerar outro par, o `OLA` com chave diferente é recusado mesmo
+  com um token novo; é preciso `/replica-remover <id>` antes. É a consequência
+  deliberada de o `id` estar ligado à chave em `replicas.txt`.
+- **`ws://` sem TLS.** Como o enunciado permite nos ensaios, o token, os `HB` e
+  os chunks cifrados circulam em claro na rede local. Os chunks continuam
+  cifrados (a confidencialidade do conteúdo depende da `master.key`), mas um
+  observador vê o ritmo, os ids e os tamanhos; `wss://` resolveria a
+  confidencialidade do token e dos metadados em trânsito.
+- **`usados`/`quota` são reportados pela réplica.** Uma réplica maliciosa pode
+  mentir no `HB`; sem desafios de posse (`POSSE?`, próximo sprint) o líder não
+  prova que os bytes existem. O `ACK` prova que a réplica disse que gravou; a
+  verificação de posse é que prova que ainda os tem.
+- **Porto do hub ocupado.** O `WebSocketServer` faz bind de forma assíncrona;
+  o arranque espera até 5 s por `onStart` e aborta com código 1 se o porto não
+  abrir (para não ficar um bot online sem hub). O erro detalhado fica em
+  `eventos-lider.txt`; verifique o porto com `ss -ltnp`.
+- **`/estado` é limitado a 15 réplicas** na listagem (com `… e N outras`) para
+  não exceder o limite de 2000 caracteres do Discord; os totais do catálogo são
+  sempre completos.
+- **`MORTA_MS = 10000`** é o valor fixado pelo E2-03 (5 heartbeats); o texto
+  geral do Epico2 refere 30 s para o trabalho completo. O sprint atual
+  sobrepõe-se e é este o valor usado no código e nos testes.
+- **O líder é um ponto único de falha para escritas**, como no enunciado: sem
+  ele não há LSN, selagem nem colocação. A recuperação total a partir das
+  réplicas é o sprint seguinte.
