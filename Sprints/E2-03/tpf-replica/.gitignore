@@ -1,0 +1,23 @@
+# ---- segredos: NUNCA no repositório ----
+# chaves Ed25519 da réplica (geradas em dados-<id>/)
+*.der
+*.key
+master.key
+
+# ---- dados de execução da réplica (gerados nos ensaios) ----
+dados-*/
+eventos-*.txt
+*.bin
+*.hdr
+
+# ---- build e IDE ----
+target/
+out/
+*.class
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# gerado pelo maven-shade-plugin
+dependency-reduced-pom.xml
